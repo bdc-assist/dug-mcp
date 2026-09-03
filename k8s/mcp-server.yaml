@@ -22,7 +22,7 @@ spec:
             - containerPort: 8000
           env:
             - name: REDIS_HOST
-              value: "search-redis-master.bdc-assist-dev.svc.cluster.local"
+              value: "search-redis-master.bdc-search-dev.svc.cluster.local"
             - name: REDIS_PORT
               value: "6379"
             - name: REDIS_PASSWORD
