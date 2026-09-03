@@ -2,7 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: redis-graph-agent
-  namespace: your-namespace
+  namespace: bdc-assist-dev
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt
     nginx.ingress.kubernetes.io/cors-allow-headers: Content-Type
@@ -11,7 +11,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-    - host: redis-agent.example.com
+    - host: dug-agent.apps.renci.org
       http:
         paths:
           - path: /
@@ -23,14 +23,14 @@ spec:
                   number: 8080
   tls:
     - hosts:
-        - redis-agent.example.com
-      secretName: redis-agent.example.com-tls
+        - dug-agent.apps.renci.org
+      secretName: dug-agent.apps.renci.org-tls
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: redis-mcp-server
-  namespace: your-namespace
+  namespace: bdc-assist-dev
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt
     nginx.ingress.kubernetes.io/cors-allow-headers: Content-Type
@@ -39,7 +39,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-    - host: redis-mcp.example.com
+    - host: dug-mcp.apps.renci.org
       http:
         paths:
           - path: /
@@ -51,5 +51,5 @@ spec:
                   number: 8000
   tls:
     - hosts:
-        - redis-mcp.example.com
-      secretName: redis-mcp.example.com-tls
+        - dug-mcp.apps.renci.org
+      secretName: dug-mcp.apps.renci.org-tls
