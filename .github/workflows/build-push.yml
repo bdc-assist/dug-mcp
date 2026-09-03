@@ -8,7 +8,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: yskale/redis-mcp-server
+  IMAGE_NAME: bdc-assist/dug-mcp
 
 jobs:
   build-and-push:

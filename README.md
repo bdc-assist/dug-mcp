@@ -1,4 +1,4 @@
-# Redis Graph MCP Server
+# DUG MCP Server
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for querying a biomedical knowledge graph stored in Redis (RedisGraph). Supports both **stdio** (Claude Desktop) and **SSE** (HTTP) transports.
 

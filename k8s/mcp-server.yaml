@@ -17,7 +17,7 @@ spec:
         - name: ghcr-pull-secret
       containers:
         - name: redis-mcp-server
-          image: ghcr.io/yskale/redis-mcp-server:latest
+          image: ghcr.io/bdc-assist/dug-mcp:latest
           ports:
             - containerPort: 8000
           env:
