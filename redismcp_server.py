@@ -1210,14 +1210,11 @@ async def _handle_find_concept_paths(arguments: dict, graph) -> list[TextContent
     limit           = arguments.get("limit", 10)
 
     query = f"""
-    MATCH (source {{id: "{source_id}"}}), (target {{id: "{target_id}"}})
-    WITH source, target
-    WITH shortestPath((source)-[*1..{max_path_length}]-(target)) AS path
-    WHERE path IS NOT NULL
+    MATCH p = (source {{id: "{source_id}"}})-[*1..{max_path_length}]-(target {{id: "{target_id}"}})
     RETURN
-        length(path) AS path_length,
-        [n IN nodes(path) | n.name] AS node_names,
-        [r IN relationships(path) | type(r)] AS relationship_types
+        length(p) AS path_length,
+        [n IN nodes(p) | n.name] AS node_names,
+        [r IN relationships(p) | type(r)] AS relationship_types
     ORDER BY path_length
     LIMIT {limit}
     """

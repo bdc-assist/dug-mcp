@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 *.pyo
 .claude/
+test_mcp.py
