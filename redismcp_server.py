@@ -38,6 +38,35 @@ redis_client = None
 graph_db = None
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _build_synonym_where(curies: list, labels: list, fallback_term: str) -> str:
+    """Build a Cypher WHERE expression from synonym enrichment results.
+
+    Matches concepts by their CURIE id, their label name, or — when both lists
+    are empty — falls back to a substring match on the raw search term.
+    """
+    clauses = []
+    if curies:
+        curie_list = ", ".join(f'"{c}"' for c in curies)
+        clauses.append(f"concept.id IN [{curie_list}]")
+    if labels:
+        label_list = ", ".join(f'"{l}"' for l in labels)
+        clauses.append(f"concept.name IN [{label_list}]")
+    if not clauses:
+        clauses.append(f"concept.name CONTAINS '{fallback_term}'")
+    return " OR ".join(clauses)
+
+
+def _truncate(out: str, limit: int = 50_000) -> str:
+    """Trim a JSON string to *limit* characters and append a notice if trimmed."""
+    if len(out) > limit:
+        return out[:limit] + "\n... (truncated)"
+    return out
+
+
 async def fetch_synonyms(search_term: str) -> dict:
     """
     Enrich a search term by fetching synonyms and related concept identifiers from:
@@ -107,6 +136,97 @@ async def fetch_synonyms(search_term: str) -> dict:
         "warnings": warnings,
     }
 
+
+# ---------------------------------------------------------------------------
+# Redis connection
+# ---------------------------------------------------------------------------
+
+def get_redis_connection():
+    """Establish Redis connection with authentication.
+
+    Uses a local variable for the Redis client so that globals are only updated
+    after a successful ping — preventing a sticky-failure state where redis_client
+    is set but graph_db is still None on every subsequent call.
+    """
+    global redis_client, graph_db
+
+    if redis_client is None:
+        host = os.getenv("REDIS_HOST", "localhost")
+        port = int(os.getenv("REDIS_PORT", "6379"))
+        password = os.getenv("REDIS_PASSWORD")
+        graph_name = os.getenv("REDIS_GRAPH_NAME", "test")
+
+        client = redis.Redis(
+            host=host,
+            port=port,
+            password=password,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_keepalive=True,
+        )
+        client.ping()  # raises on failure; globals are NOT updated if this throws
+        redis_client = client
+        graph_db = Graph(redis_client, graph_name)
+
+    return redis_client, graph_db
+
+
+# ---------------------------------------------------------------------------
+# Result serialization
+# ---------------------------------------------------------------------------
+
+def _serialize_value(val):
+    """Convert a RedisGraph Node/Edge/Path to a clean dict; pass through scalars."""
+    cls = type(val).__name__
+    if cls == "Node":
+        # labels is a list ordered general→specific; pick the last (most specific)
+        labels = val.labels if val.labels else []
+        label = labels[-1] if labels else ""
+        category = label.replace("biolink.", "biolink:") if label else None
+        props = dict(val.properties) if val.properties else {}
+        out = {}
+        if category:
+            out["category"] = category
+        out["id"] = props.get("id", props.get("curie", None))
+        out["name"] = props.get("name", None)
+        extra = {k: v for k, v in props.items() if k not in ("id", "curie", "name")}
+        if extra:
+            out["properties"] = extra
+        return out
+    elif cls == "Edge":
+        rel = getattr(val, "relation", None) or ""
+        predicate = rel.replace("biolink.", "biolink:") if rel else None
+        props = dict(val.properties) if val.properties else {}
+        return {
+            "predicate": predicate,
+            "src_node": val.src_node,
+            "dest_node": val.dest_node,
+            **({"properties": props} if props else {}),
+        }
+    elif cls == "Path":
+        # Path.nodes() and Path.edges() are methods, not properties
+        nodes = val.nodes() if callable(val.nodes) else val.nodes
+        edges = val.edges() if callable(val.edges) else val.edges
+        return {"nodes": [_serialize_value(n) for n in nodes],
+                "edges": [_serialize_value(e) for e in edges]}
+    return val
+
+
+def results_to_list(result_set, header) -> list[dict]:
+    """Convert a RedisGraph result set to a list of dicts keyed by column name."""
+    if not result_set or not header:
+        return []
+    col_names = [col[1] for col in header]
+    return [{col: _serialize_value(val) for col, val in zip(col_names, row)} for row in result_set]
+
+
+def to_json(data) -> str:
+    return json.dumps(data, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
 
 @app.list_prompts()
 async def list_prompts() -> list[Prompt]:
@@ -377,37 +497,13 @@ async def get_prompt(name: str, arguments: dict) -> GetPromptResult:
         raise ValueError(f"Unknown prompt: {name}")
 
 
-def get_redis_connection():
-    """Establish Redis connection with authentication"""
-    global redis_client, graph_db
-
-    if redis_client is None:
-        host = os.getenv("REDIS_HOST", "localhost")
-        port = int(os.getenv("REDIS_PORT", "6379"))
-        password = os.getenv("REDIS_PASSWORD")
-        graph_name = os.getenv("REDIS_GRAPH_NAME", "test")
-
-        try:
-            redis_client = redis.Redis(
-                host=host,
-                port=port,
-                password=password,
-                decode_responses=True,
-                socket_connect_timeout=5,
-                socket_keepalive=True
-            )
-            # Test connection
-            redis_client.ping()
-            graph_db = Graph(redis_client, graph_name)
-        except Exception:
-            raise
-
-    return redis_client, graph_db
-
+# ---------------------------------------------------------------------------
+# Tool definitions
+# ---------------------------------------------------------------------------
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    """List available tools for querying the Redis graph"""
+    """List available tools for querying the Redis graph."""
     return [
         Tool(
             name="trapi_query",
@@ -743,772 +839,656 @@ async def list_tools() -> list[Tool]:
     ]
 
 
-def _serialize_value(val):
-    """Convert a RedisGraph Node/Edge/Path to a clean dict; pass through scalars."""
-    cls = type(val).__name__
-    if cls == "Node":
-        # labels is a list ordered general→specific; pick the last (most specific)
-        labels = val.labels if val.labels else []
-        label = labels[-1] if labels else ""
-        category = label.replace("biolink.", "biolink:") if label else None
-        props = dict(val.properties) if val.properties else {}
-        out = {}
-        if category:
-            out["category"] = category
-        out["id"] = props.get("id", props.get("curie", None))
-        out["name"] = props.get("name", None)
-        extra = {k: v for k, v in props.items() if k not in ("id", "curie", "name")}
-        if extra:
-            out["properties"] = extra
-        return out
-    elif cls == "Edge":
-        rel = getattr(val, "relation", None) or ""
-        predicate = rel.replace("biolink.", "biolink:") if rel else None
-        props = dict(val.properties) if val.properties else {}
-        return {
-            "predicate": predicate,
-            "src_node": val.src_node,
-            "dest_node": val.dest_node,
-            **({"properties": props} if props else {}),
+# ---------------------------------------------------------------------------
+# Tool handlers — one async function per tool
+# ---------------------------------------------------------------------------
+
+async def _handle_trapi_query(arguments: dict, graph) -> list[TextContent]:
+    qgraph = arguments["qgraph"]
+    limit  = arguments.get("limit", 50)
+
+    # Generate Cypher from TRAPI query graph using reasoner-transpiler.
+    # Use memgraph dialect (uses id() instead of elementId()) — closer to RedisGraph.
+    # reasoner=False gives plain Cypher without TRAPI result wrapping.
+    cypher = trapi_get_query(qgraph, reasoner=False, dialect="memgraph")
+
+    # RedisGraph uses backtick-wrapped dot notation: `biolink.Disease`
+    # Transpiler outputs colon notation: `biolink:Disease` — convert it.
+    cypher = re.sub(r'`biolink:(\w+)`', r'`biolink.\1`', cypher)
+
+    if "LIMIT" not in cypher.upper():
+        cypher += f" LIMIT {limit}"
+
+    result = graph.query(cypher)
+    rows = results_to_list(result.result_set, result.header) if result.result_set else []
+    return [TextContent(type="text", text=to_json({
+        "qgraph": qgraph,
+        "cypher_used": cypher,
+        "total_results": len(rows),
+        "results": rows,
+    }))]
+
+
+async def _handle_cypher_query(arguments: dict, graph) -> list[TextContent]:
+    query = arguments["query"]
+    result = graph.query(query)
+
+    if result.result_set:
+        rows = results_to_list(result.result_set, result.header)
+        out = _truncate(to_json({
+            "rows_returned": len(rows),
+            "execution_time_ms": result.execution_time,
+            "results": rows,
+        }))
+        return [TextContent(type="text", text=out)]
+    else:
+        return [TextContent(type="text", text=to_json({"rows_returned": 0, "results": []}))]
+
+
+async def _handle_search_concepts(arguments: dict, graph) -> list[TextContent]:
+    search_term    = arguments["search_term"]
+    node_type      = arguments.get("node_type")
+    find_variables = arguments.get("find_variables", False)
+    limit          = arguments.get("limit", 20)
+
+    if find_variables:
+        synonyms = await fetch_synonyms(search_term)
+        curies   = synonyms["curies"]
+        labels   = synonyms["labels"]
+        warnings = synonyms["warnings"]
+
+        where_expr = _build_synonym_where(curies, labels, search_term)
+
+        # Fetch all (variable, concept, predicate) matches — no LIMIT here.
+        # Dedup is done in Python after grouping by variable_id.
+        query = f"""
+        MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
+        WHERE ({where_expr})
+          AND NOT labels(concept)[0] = 'biolink.StudyVariable'
+        RETURN
+            v.id AS variable_id,
+            v.name AS variable_name,
+            v.description AS variable_description,
+            concept.id AS concept_id,
+            concept.name AS concept_name,
+            labels(concept)[0] AS concept_type,
+            type(r) AS predicate
+        """
+        result = graph.query(query)
+        rows = results_to_list(result.result_set, result.header) if result.result_set else []
+
+        # Group by variable_id — one entry per unique variable,
+        # with a matched_concepts list showing which concepts and predicates matched.
+        variables: dict = {}
+        for row in rows:
+            vid = row["variable_id"]
+            if vid not in variables:
+                variables[vid] = {
+                    "variable_id": vid,
+                    "variable_name": row["variable_name"],
+                    "variable_description": row.get("variable_description"),
+                    "matched_concepts": [],
+                }
+            predicate  = row["predicate"].replace("biolink.", "biolink:") if row.get("predicate") else None
+            concept_id = row["concept_id"]
+            # Dedup matched concepts by (concept_id, predicate) — graph can have
+            # edges in both directions between the same pair of nodes.
+            seen = {(c["concept_id"], c["predicate"]) for c in variables[vid]["matched_concepts"]}
+            if (concept_id, predicate) not in seen:
+                variables[vid]["matched_concepts"].append({
+                    "concept_id": concept_id,
+                    "concept_name": row["concept_name"],
+                    "concept_type": row["concept_type"].replace("biolink.", "biolink:") if row.get("concept_type") else None,
+                    "predicate": predicate,
+                })
+
+        # Sort by number of matched concepts descending (relevance proxy),
+        # then apply limit on unique variables.
+        unique_vars = sorted(variables.values(), key=lambda v: len(v["matched_concepts"]), reverse=True)
+        unique_vars = unique_vars[:limit]
+
+        out = _truncate(to_json({
+            "search_term": search_term,
+            "enrichment": {
+                "curies": curies,
+                "labels": labels,
+                **({"warnings": warnings} if warnings else {}),
+            },
+            "total_results": len(unique_vars),
+            "variables": unique_vars,
+        }))
+        return [TextContent(type="text", text=out)]
+
+    else:
+        type_match = f"(n:`biolink.{node_type}`)" if node_type else "(n)"
+        query = f"""
+        MATCH {type_match}
+        WHERE n.name CONTAINS '{search_term}'
+        RETURN labels(n)[0] AS type, n.name AS name, n.id AS id
+        LIMIT {limit}
+        """
+        result = graph.query(query)
+        rows = results_to_list(result.result_set, result.header) if result.result_set else []
+        out = _truncate(to_json({
+            "search_term": search_term,
+            "node_type": node_type,
+            "total_results": len(rows),
+            "concepts": rows,
+        }))
+        return [TextContent(type="text", text=out)]
+
+
+async def _handle_get_concept_graph(arguments: dict, graph) -> list[TextContent]:
+    concept_id   = arguments["concept_id"]
+    expand_depth = min(arguments.get("expand_depth", 2), 3)
+    limit        = arguments.get("limit", 100)
+
+    if expand_depth == 1:
+        query = f"""
+        MATCH (concept {{id: "{concept_id}"}})-[r1]-(connected)
+        RETURN concept.name AS concept,
+               type(r1) AS rel_type,
+               labels(connected)[0] AS connected_type,
+               connected.name AS connected_name,
+               connected.id AS connected_id
+        LIMIT {limit}
+        """
+    else:
+        query = f"""
+        MATCH (concept {{id: "{concept_id}"}})-[r1]-(variable:`biolink.StudyVariable`)
+        OPTIONAL MATCH (variable)-[r2]-(study:`biolink.Study`)
+        OPTIONAL MATCH (variable)-[r3]-(related)
+        WHERE related <> concept
+        RETURN DISTINCT
+            concept.name AS concept,
+            concept.id AS concept_id,
+            labels(concept)[0] AS concept_type,
+            variable.name AS variable_name,
+            variable.id AS variable_id,
+            study.name AS study_name,
+            study.id AS study_id,
+            COUNT(DISTINCT related) AS related_concepts_count
+        LIMIT {limit}
+        """
+
+    result = graph.query(query)
+    if result.result_set:
+        rows = results_to_list(result.result_set, result.header)
+        for row in rows:
+            if row.get("concept_type"):
+                row["concept_type"] = row["concept_type"].replace("biolink.", "biolink:")
+        out = _truncate(to_json({
+            "concept_id": concept_id,
+            "expand_depth": expand_depth,
+            "total_results": len(rows),
+            "graph": rows,
+        }))
+        return [TextContent(type="text", text=out)]
+    else:
+        return [TextContent(type="text", text=to_json({"concept_id": concept_id, "total_results": 0, "graph": []}))]
+
+
+async def _handle_get_concept_connections(arguments: dict, graph) -> list[TextContent]:
+    concept_id      = arguments["concept_id"]
+    node_type_filter = arguments.get("node_type_filter")
+    limit           = arguments.get("limit", 50)
+
+    type_clause = f":`biolink.{node_type_filter}`" if node_type_filter else ""
+
+    summary_result = graph.query(f"""
+    MATCH (concept {{id: "{concept_id}"}})-[r]-(connected{type_clause})
+    WITH labels(connected)[0] AS entity_type, COUNT(*) AS count
+    RETURN entity_type, count
+    ORDER BY count DESC
+    """)
+
+    detail_result = graph.query(f"""
+    MATCH (concept {{id: "{concept_id}"}})-[r]-(connected{type_clause})
+    RETURN
+        type(r) AS relationship,
+        labels(connected)[0] AS connected_type,
+        connected.name AS connected_name,
+        connected.id AS connected_id
+    ORDER BY labels(connected)[0], type(r), connected.name
+    LIMIT {limit}
+    """)
+
+    summary     = [{"entity_type": row[0], "count": row[1]} for row in (summary_result.result_set or [])]
+    connections = results_to_list(detail_result.result_set, detail_result.header) if detail_result.result_set else []
+    out = _truncate(to_json({
+        "concept_id": concept_id,
+        "node_type_filter": node_type_filter,
+        "summary": summary,
+        "total_connections_shown": len(connections),
+        "connections": connections,
+    }))
+    return [TextContent(type="text", text=out)]
+
+
+async def _handle_list_graph_schema(arguments: dict, graph) -> list[TextContent]:
+    show_counts = arguments.get("show_counts", True)
+
+    if show_counts:
+        query = """
+        MATCH (n)
+        WITH labels(n)[0] AS node_type, COUNT(*) AS count
+        RETURN node_type, count
+        ORDER BY count DESC
+        """
+    else:
+        query = """
+        MATCH (n)
+        WITH DISTINCT labels(n)[0] AS node_type
+        RETURN node_type
+        ORDER BY node_type
+        """
+
+    result = graph.query(query)
+    rows = results_to_list(result.result_set, result.header) if result.result_set else []
+    return [TextContent(type="text", text=to_json({"schema": rows}))]
+
+
+async def _handle_find_highly_connected_variables(arguments: dict, graph) -> list[TextContent]:
+    min_connections = arguments.get("min_connections", 10)
+    limit           = arguments.get("limit", 20)
+
+    query = f"""
+    MATCH (v:`biolink.StudyVariable`)--(c)
+    WITH v, COUNT(DISTINCT c) AS connection_count
+    WHERE connection_count >= {min_connections}
+    RETURN v.name AS variable_name, v.id AS variable_id, connection_count
+    ORDER BY connection_count DESC
+    LIMIT {limit}
+    """
+
+    result = graph.query(query)
+    rows = results_to_list(result.result_set, result.header) if result.result_set else []
+    return [TextContent(type="text", text=to_json({
+        "min_connections": min_connections,
+        "total_results": len(rows),
+        "variables": rows,
+    }))]
+
+
+async def _handle_search_variables_by_name(arguments: dict, graph) -> list[TextContent]:
+    search_term = arguments["search_term"]
+    limit       = arguments.get("limit", 20)
+
+    query = f"""
+    MATCH (v:`biolink.StudyVariable`)
+    WHERE v.name CONTAINS '{search_term}' OR v.id CONTAINS '{search_term}'
+    RETURN v.id AS variable_id, v.name AS variable_name
+    LIMIT {limit}
+    """
+
+    result = graph.query(query)
+    rows = results_to_list(result.result_set, result.header) if result.result_set else []
+    out = _truncate(to_json({"search_term": search_term, "total_results": len(rows), "variables": rows}))
+    return [TextContent(type="text", text=out)]
+
+
+async def _handle_expand_concept(arguments: dict, graph) -> list[TextContent]:
+    concept_id         = arguments["concept_id"]
+    max_hops           = min(arguments.get("max_hops", 2), 3)
+    relationship_types = arguments.get("relationship_types")
+    limit              = arguments.get("limit", 50)
+
+    # Conditionally add a relationship-type filter to the WHERE clause.
+    rel_filter = (
+        f"AND ALL(rel in relationships(path) WHERE type(rel) IN {relationship_types})"
+        if relationship_types else ""
+    )
+    query = f"""
+    MATCH path = (source {{id: "{concept_id}"}})-[r*1..{max_hops}]-(expanded)
+    WHERE source <> expanded
+      {rel_filter}
+    WITH expanded,
+         labels(expanded)[0] AS expanded_type,
+         length(path) AS hops,
+         [rel in relationships(path) | type(rel)] AS path_relationships
+    RETURN DISTINCT
+        expanded.id AS concept_id,
+        expanded.name AS concept_name,
+        expanded_type,
+        hops,
+        path_relationships
+    ORDER BY hops, expanded.name
+    LIMIT {limit}
+    """
+
+    result = graph.query(query)
+    rows = results_to_list(result.result_set, result.header) if result.result_set else []
+    out = _truncate(to_json({
+        "concept_id": concept_id,
+        "max_hops": max_hops,
+        "relationship_types": relationship_types,
+        "total_results": len(rows),
+        "expanded": rows,
+    }))
+    return [TextContent(type="text", text=out)]
+
+
+async def _handle_find_concept_paths(arguments: dict, graph) -> list[TextContent]:
+    source_id       = arguments["source_id"]
+    target_id       = arguments["target_id"]
+    max_path_length = min(arguments.get("max_path_length", 3), 5)
+    limit           = arguments.get("limit", 10)
+
+    query = f"""
+    MATCH path = shortestPath((source {{id: "{source_id}"}})-[*1..{max_path_length}]-(target {{id: "{target_id}"}}))
+    WITH path, length(path) AS path_length
+    UNWIND nodes(path) AS node
+    UNWIND relationships(path) AS rel
+    WITH path, path_length,
+         collect(DISTINCT node.name) AS node_names,
+         collect(DISTINCT type(rel)) AS relationship_types
+    RETURN
+        path_length,
+        node_names,
+        relationship_types
+    ORDER BY path_length
+    LIMIT {limit}
+    """
+
+    result = graph.query(query)
+    rows = results_to_list(result.result_set, result.header) if result.result_set else []
+    out = _truncate(to_json({
+        "source_id": source_id,
+        "target_id": target_id,
+        "max_path_length": max_path_length,
+        "total_paths": len(rows),
+        "paths": rows,
+    }))
+    return [TextContent(type="text", text=out)]
+
+
+async def _handle_picsure_search(arguments: dict, graph) -> list[TextContent]:
+    phv_ids  = arguments.get("phv_ids", [])
+    keyword  = arguments.get("keyword", "")
+    semantic = arguments.get("semantic", True)
+    limit    = arguments.get("limit", 20)
+
+    if not phv_ids and not keyword:
+        return [TextContent(type="text", text=to_json({"error": "Provide phv_ids or keyword"}))]
+
+    enrichment_info  = None
+    warnings         = []
+    original_keyword = keyword
+    phv_to_concepts: dict = {}
+
+    # Semantic mode: enrich keyword → KG → phv IDs, then PIC-SURE path lookup
+    if keyword and semantic:
+        synonyms = await fetch_synonyms(keyword)
+        curies   = synonyms["curies"]
+        labels   = synonyms["labels"]
+        warnings.extend(synonyms.get("warnings", []))
+        enrichment_info = {"curies": curies, "labels": labels}
+
+        where_expr = _build_synonym_where(curies, labels, keyword)
+
+        kg_query = f"""
+        MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
+        WHERE ({where_expr})
+          AND NOT labels(concept)[0] = 'biolink.StudyVariable'
+        RETURN DISTINCT v.id AS variable_id, concept.id AS concept_id, concept.name AS concept_name
+        LIMIT {limit * 5}
+        """
+        kg_result = graph.query(kg_query)
+        kg_rows   = results_to_list(kg_result.result_set, kg_result.header) if kg_result.result_set else []
+
+        kg_phv_ids = []
+        for row in kg_rows:
+            vid = row.get("variable_id") or ""
+            phv = vid.split(".")[0] if "." in vid else vid
+            if not phv.startswith("phv"):
+                continue
+            if phv not in phv_to_concepts:
+                phv_to_concepts[phv] = []
+                kg_phv_ids.append(phv)
+            concept_entry = {"concept_id": row.get("concept_id"), "concept_name": row.get("concept_name")}
+            if concept_entry not in phv_to_concepts[phv]:
+                phv_to_concepts[phv].append(concept_entry)
+
+        phv_ids = list(dict.fromkeys(list(phv_ids) + kg_phv_ids))
+        keyword = ""  # phv IDs now drive the PIC-SURE lookup
+
+    # Strip version suffixes: "phv00425822.v1.p1" → "phv00425822"
+    search_terms = [pid.split(".")[0] if "." in pid else pid for pid in phv_ids]
+    if keyword:
+        search_terms.append(keyword)
+    search_terms = list(dict.fromkeys(search_terms))  # deduplicate
+
+    results: list = []
+    seen_paths: set = set()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        responses = await asyncio.gather(*[
+            client.post(PICSURE_SEARCH_URL, json={"query": term})
+            for term in search_terms
+        ], return_exceptions=True)
+
+    for term, resp in zip(search_terms, responses):
+        if len(results) >= limit:
+            break
+        if isinstance(resp, Exception):
+            warnings.append(f"PIC-SURE search failed for '{term}': {resp}")
+            continue
+        if resp.status_code != 200:
+            warnings.append(f"PIC-SURE returned HTTP {resp.status_code} for '{term}'")
+            continue
+        try:
+            phenotypes = resp.json().get("results", {}).get("phenotypes", {})
+            for path, meta in phenotypes.items():
+                if len(results) >= limit:
+                    break
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                parts      = [p for p in path.strip("\\").split("\\") if p]
+                study      = parts[0] if parts else None
+                phv        = next((p for p in parts if p.startswith("phv")), None)
+                vname      = parts[-1] if len(parts) > 1 else None
+                cat_values = meta.get("categoryValues", [])
+                entry = {
+                    "picsure_path": path,
+                    "study": study,
+                    "phv_id": phv,
+                    "variable_name": vname,
+                    "categorical": meta.get("categorical"),
+                    "category_values": cat_values[:20],
+                    "total_category_values": len(cat_values),
+                }
+                if phv and phv in phv_to_concepts:
+                    entry["matched_concepts"] = phv_to_concepts[phv]
+                results.append(entry)
+        except Exception as e:
+            warnings.append(f"Failed to parse PIC-SURE response for '{term}': {e}")
+
+    out = _truncate(to_json({
+        "keyword": original_keyword if original_keyword else None,
+        "mode": "semantic" if (original_keyword and semantic) else "direct",
+        **({"enrichment": enrichment_info} if enrichment_info else {}),
+        "total_variables_found": len(results),
+        "variables": results,
+        **({"warnings": warnings} if warnings else {}),
+    }))
+    return [TextContent(type="text", text=out)]
+
+
+async def _handle_find_cohort_variables(arguments: dict, graph) -> list[TextContent]:
+    concepts             = arguments.get("concepts", [])
+    variables_per_concept = arguments.get("variables_per_concept", 20)
+    limit                = arguments.get("limit", 10)
+
+    if not concepts:
+        return [TextContent(type="text", text=to_json({"error": "Provide at least one concept"}))]
+
+    # Step 1: Parallel synonym enrichment for all concepts
+    enrichments = await asyncio.gather(
+        *[fetch_synonyms(c) for c in concepts],
+        return_exceptions=True,
+    )
+
+    all_warnings = []
+    concept_data = []
+    for concept, enrichment in zip(concepts, enrichments):
+        if isinstance(enrichment, Exception):
+            all_warnings.append(f"Enrichment failed for '{concept}': {enrichment}")
+            curies, labels = [], [concept]
+        else:
+            curies = enrichment["curies"]
+            labels = enrichment["labels"]
+            all_warnings.extend(enrichment.get("warnings", []))
+        concept_data.append({"concept": concept, "curies": curies, "labels": labels, "variables": []})
+
+    # Step 2: KG query per concept to get linked StudyVariables
+    for cdata in concept_data:
+        where_expr = _build_synonym_where(cdata["curies"], cdata["labels"], cdata["concept"])
+        kg_query = f"""
+        MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
+        WHERE ({where_expr})
+          AND NOT labels(concept)[0] = 'biolink.StudyVariable'
+        RETURN DISTINCT v.id AS variable_id, v.name AS variable_name
+        LIMIT {variables_per_concept * 5}
+        """
+        try:
+            kg_result = graph.query(kg_query)
+            kg_rows   = results_to_list(kg_result.result_set, kg_result.header) if kg_result.result_set else []
+            seen_ids: set = set()
+            for row in kg_rows:
+                vid = row.get("variable_id")
+                if vid and vid not in seen_ids:
+                    seen_ids.add(vid)
+                    cdata["variables"].append({"variable_id": vid, "variable_name": row.get("variable_name")})
+                    if len(cdata["variables"]) >= variables_per_concept:
+                        break
+        except Exception as e:
+            all_warnings.append(f"KG query failed for '{cdata['concept']}': {e}")
+
+    # Step 3: Build variable_id → concepts mapping
+    var_to_concepts: dict = {}
+    for cdata in concept_data:
+        for var in cdata["variables"]:
+            vid = var["variable_id"]
+            if vid:
+                if vid not in var_to_concepts:
+                    var_to_concepts[vid] = []
+                if cdata["concept"] not in var_to_concepts[vid]:
+                    var_to_concepts[vid].append(cdata["concept"])
+
+    all_var_ids = list(var_to_concepts.keys())
+
+    # Step 4: KG query to map variable_ids → studies directly (no PIC-SURE)
+    study_concepts: dict  = {}
+    study_variables: dict = {}
+    if all_var_ids:
+        id_list = ", ".join(f'"{vid}"' for vid in all_var_ids)
+        kg_study_query = f"""
+        MATCH (v:`biolink.StudyVariable`)-[]-(s:`biolink.Study`)
+        WHERE v.id IN [{id_list}]
+        RETURN v.id AS variable_id, v.name AS variable_name, s.id AS study_id, s.name AS study_name
+        """
+        try:
+            study_result = graph.query(kg_study_query)
+            study_rows = results_to_list(study_result.result_set, study_result.header) if study_result.result_set else []
+            for row in study_rows:
+                vid      = row["variable_id"]
+                study_id = row["study_id"]
+                if not study_id:
+                    continue
+                if study_id not in study_concepts:
+                    study_concepts[study_id]  = set()
+                    study_variables[study_id] = []
+                for c in var_to_concepts.get(vid, []):
+                    study_concepts[study_id].add(c)
+                existing = {v["variable_id"] for v in study_variables[study_id]}
+                if vid not in existing:
+                    study_variables[study_id].append({
+                        "variable_id":      vid,
+                        "variable_name":    row.get("variable_name"),
+                        "study_id":         study_id,
+                        "study_name":       row.get("study_name"),
+                        "matched_concepts": var_to_concepts.get(vid, []),
+                    })
+        except Exception as e:
+            all_warnings.append(f"KG study lookup failed: {e}")
+
+    all_concept_names = {cdata["concept"] for cdata in concept_data}
+    feasible_studies  = []
+    partial_studies   = []
+    for study_id, concepts_present in sorted(study_concepts.items(), key=lambda x: len(x[1]), reverse=True):
+        missing = all_concept_names - concepts_present
+        entry = {
+            "study_id":        study_id,
+            "study_name":      (study_variables[study_id][0]["study_name"] if study_variables[study_id] else None),
+            "concepts_found":  sorted(concepts_present),
+            "concepts_missing": sorted(missing),
+            "variables":       study_variables[study_id],
         }
-    elif cls == "Path":
-        # Path.nodes() and Path.edges() are methods, not properties
-        nodes = val.nodes() if callable(val.nodes) else val.nodes
-        edges = val.edges() if callable(val.edges) else val.edges
-        return {"nodes": [_serialize_value(n) for n in nodes],
-                "edges": [_serialize_value(e) for e in edges]}
-    return val
+        if not missing:
+            feasible_studies.append(entry)
+        else:
+            partial_studies.append(entry)
+
+    feasible_studies = feasible_studies[:limit]
+    partial_studies  = partial_studies[:5]
+
+    out = _truncate(to_json({
+        "concepts_searched": [cdata["concept"] for cdata in concept_data],
+        "enrichment_summary": [
+            {
+                "concept":        cdata["concept"],
+                "curies_found":   len(cdata["curies"]),
+                "variables_in_kg": len(cdata["variables"]),
+            }
+            for cdata in concept_data
+        ],
+        "feasible_studies_count": len(feasible_studies),
+        "feasible_studies": feasible_studies,
+        "partial_studies":  partial_studies,
+        **({"warnings": all_warnings} if all_warnings else {}),
+    }))
+    return [TextContent(type="text", text=out)]
 
 
-def results_to_list(result_set, header) -> list[dict]:
-    """Convert a RedisGraph result set to a list of dicts keyed by column name."""
-    if not result_set or not header:
-        return []
-    col_names = [col[1] for col in header]
-    rows = []
-    for row in result_set:
-        rows.append({col: _serialize_value(val) for col, val in zip(col_names, row)})
-    return rows
+# ---------------------------------------------------------------------------
+# Tool dispatcher
+# ---------------------------------------------------------------------------
 
-
-def to_json(data) -> str:
-    return json.dumps(data, indent=2, default=str)
+_TOOL_HANDLERS = {
+    "trapi_query":                     _handle_trapi_query,
+    "cypher_query":                    _handle_cypher_query,
+    "search_concepts":                 _handle_search_concepts,
+    "get_concept_graph":               _handle_get_concept_graph,
+    "get_concept_connections":         _handle_get_concept_connections,
+    "list_graph_schema":               _handle_list_graph_schema,
+    "find_highly_connected_variables": _handle_find_highly_connected_variables,
+    "search_variables_by_name":        _handle_search_variables_by_name,
+    "expand_concept":                  _handle_expand_concept,
+    "find_concept_paths":              _handle_find_concept_paths,
+    "picsure_search":                  _handle_picsure_search,
+    "find_cohort_variables":           _handle_find_cohort_variables,
+}
 
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    """Handle tool calls"""
+    """Dispatch incoming tool calls to their dedicated handler functions."""
     try:
         _, graph = get_redis_connection()
-        
-        if name == "trapi_query":
-            qgraph = arguments["qgraph"]
-            limit  = arguments.get("limit", 50)
-
-            # Generate Cypher from TRAPI query graph using reasoner-transpiler.
-            # Use memgraph dialect (uses id() instead of elementId()) — closer to RedisGraph.
-            # reasoner=False gives plain Cypher without TRAPI result wrapping.
-            cypher = trapi_get_query(qgraph, reasoner=False, dialect="memgraph")
-
-            # RedisGraph uses backtick-wrapped dot notation: `biolink.Disease`
-            # Transpiler outputs colon notation: `biolink:Disease` — convert it.
-            cypher = re.sub(r'`biolink:(\w+)`', r'`biolink.\1`', cypher)
-
-            # Append limit
-            if "LIMIT" not in cypher.upper():
-                cypher += f" LIMIT {limit}"
-
-            result = graph.query(cypher)
-            rows = results_to_list(result.result_set, result.header) if result.result_set else []
-            return [TextContent(type="text", text=to_json({
-                "qgraph": qgraph,
-                "cypher_used": cypher,
-                "total_results": len(rows),
-                "results": rows,
-            }))]
-
-        elif name == "cypher_query":
-            query = arguments["query"]
-            result = graph.query(query)
-
-            if result.result_set and len(result.result_set) > 0:
-                rows = results_to_list(result.result_set, result.header)
-                out = to_json({
-                    "rows_returned": len(rows),
-                    "execution_time_ms": result.execution_time,
-                    "results": rows,
-                })
-                if len(out) > 50000:
-                    out = out[:50000] + "\n... (truncated)"
-                return [TextContent(type="text", text=out)]
-            else:
-                return [TextContent(type="text", text=to_json({"rows_returned": 0, "results": []}))]
-
-        elif name == "search_concepts":
-            search_term = arguments["search_term"]
-            node_type = arguments.get("node_type")
-            find_variables = arguments.get("find_variables", False)
-            limit = arguments.get("limit", 20)
-
-            if find_variables:
-                synonyms = await fetch_synonyms(search_term)
-                curies = synonyms["curies"]
-                labels = synonyms["labels"]
-                warnings = synonyms["warnings"]
-
-                curie_list = ", ".join(f'"{c}"' for c in curies) if curies else None
-                label_list = ", ".join(f'"{l}"' for l in labels) if labels else None
-
-                where_clauses = []
-                if curie_list:
-                    where_clauses.append(f"concept.id IN [{curie_list}]")
-                if label_list:
-                    where_clauses.append(f"concept.name IN [{label_list}]")
-                if not where_clauses:
-                    where_clauses.append(f"concept.name CONTAINS '{search_term}'")
-                where_expr = " OR ".join(where_clauses)
-
-                # Fetch all (variable, concept, predicate) matches — no LIMIT here.
-                # Dedup is done in Python after grouping by variable_id.
-                query = f"""
-                MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
-                WHERE ({where_expr})
-                  AND NOT labels(concept)[0] = 'biolink.StudyVariable'
-                RETURN
-                    v.id AS variable_id,
-                    v.name AS variable_name,
-                    v.description AS variable_description,
-                    concept.id AS concept_id,
-                    concept.name AS concept_name,
-                    labels(concept)[0] AS concept_type,
-                    type(r) AS predicate
-                """
-                result = graph.query(query)
-                rows = results_to_list(result.result_set, result.header) if result.result_set else []
-
-                # Group by variable_id — one entry per unique variable,
-                # with a matched_concepts list showing which concepts and predicates matched.
-                variables: dict = {}
-                for row in rows:
-                    vid = row["variable_id"]
-                    if vid not in variables:
-                        variables[vid] = {
-                            "variable_id": vid,
-                            "variable_name": row["variable_name"],
-                            "variable_description": row.get("variable_description"),
-                            "matched_concepts": [],
-                        }
-                    concept_id = row["concept_id"]
-                    predicate = row["predicate"].replace("biolink.", "biolink:") if row.get("predicate") else None
-                    # Dedup matched concepts by (concept_id, predicate) — graph can have
-                    # edges in both directions between the same pair of nodes.
-                    seen = {(c["concept_id"], c["predicate"]) for c in variables[vid]["matched_concepts"]}
-                    if (concept_id, predicate) not in seen:
-                        variables[vid]["matched_concepts"].append({
-                            "concept_id": concept_id,
-                            "concept_name": row["concept_name"],
-                            "concept_type": row["concept_type"].replace("biolink.", "biolink:") if row.get("concept_type") else None,
-                            "predicate": predicate,
-                        })
-
-                # Sort by number of matched concepts descending (relevance proxy),
-                # then apply limit on unique variables.
-                unique_vars = sorted(variables.values(), key=lambda v: len(v["matched_concepts"]), reverse=True)
-                unique_vars = unique_vars[:limit]
-
-                out = to_json({
-                    "search_term": search_term,
-                    "enrichment": {
-                        "curies": curies,
-                        "labels": labels,
-                        **({"warnings": warnings} if warnings else {}),
-                    },
-                    "total_results": len(unique_vars),
-                    "variables": unique_vars,
-                })
-                if len(out) > 50000:
-                    out = out[:50000] + "\n... (truncated)"
-                return [TextContent(type="text", text=out)]
-
-            else:
-                if node_type:
-                    query = f"""
-                    MATCH (n:`biolink.{node_type}`)
-                    WHERE n.name CONTAINS '{search_term}'
-                    RETURN labels(n)[0] AS type, n.name AS name, n.id AS id
-                    LIMIT {limit}
-                    """
-                else:
-                    query = f"""
-                    MATCH (n)
-                    WHERE n.name CONTAINS '{search_term}'
-                    RETURN labels(n)[0] AS type, n.name AS name, n.id AS id
-                    LIMIT {limit}
-                    """
-                result = graph.query(query)
-                rows = results_to_list(result.result_set, result.header) if result.result_set else []
-                out = to_json({
-                    "search_term": search_term,
-                    "node_type": node_type,
-                    "total_results": len(rows),
-                    "concepts": rows,
-                })
-                if len(out) > 50000:
-                    out = out[:50000] + "\n... (truncated)"
-                return [TextContent(type="text", text=out)]
-
-        elif name == "get_concept_graph":
-            concept_id = arguments["concept_id"]
-            expand_depth = min(arguments.get("expand_depth", 2), 3)
-            limit = arguments.get("limit", 100)
-
-            if expand_depth == 1:
-                query = f"""
-                MATCH (concept {{id: "{concept_id}"}})-[r1]-(connected)
-                RETURN concept.name AS concept,
-                       type(r1) AS rel_type,
-                       labels(connected)[0] AS connected_type,
-                       connected.name AS connected_name,
-                       connected.id AS connected_id
-                LIMIT {limit}
-                """
-            else:
-                query = f"""
-                MATCH (concept {{id: "{concept_id}"}})-[r1]-(variable:`biolink.StudyVariable`)
-                OPTIONAL MATCH (variable)-[r2]-(study:`biolink.Study`)
-                OPTIONAL MATCH (variable)-[r3]-(related)
-                WHERE related <> concept
-                RETURN DISTINCT
-                    concept.name AS concept,
-                    concept.id AS concept_id,
-                    labels(concept)[0] AS concept_type,
-                    variable.name AS variable_name,
-                    variable.id AS variable_id,
-                    study.name AS study_name,
-                    study.id AS study_id,
-                    COUNT(DISTINCT related) AS related_concepts_count
-                LIMIT {limit}
-                """
-
-            result = graph.query(query)
-            if result.result_set:
-                rows = results_to_list(result.result_set, result.header)
-                out = to_json({"concept_id": concept_id, "expand_depth": expand_depth, "total_results": len(rows), "graph": rows})
-                if len(out) > 50000:
-                    out = out[:50000] + "\n... (truncated)"
-                return [TextContent(type="text", text=out)]
-            else:
-                return [TextContent(type="text", text=to_json({"concept_id": concept_id, "total_results": 0, "graph": []}))]
-
-        elif name == "get_concept_connections":
-            concept_id = arguments["concept_id"]
-            node_type_filter = arguments.get("node_type_filter")
-            limit = arguments.get("limit", 50)
-
-            type_clause = f":`biolink.{node_type_filter}`" if node_type_filter else ""
-
-            summary_result = graph.query(f"""
-            MATCH (concept {{id: "{concept_id}"}})-[r]-(connected{type_clause})
-            WITH labels(connected)[0] AS entity_type, COUNT(*) AS count
-            RETURN entity_type, count
-            ORDER BY count DESC
-            """)
-
-            detail_result = graph.query(f"""
-            MATCH (concept {{id: "{concept_id}"}})-[r]-(connected{type_clause})
-            RETURN
-                type(r) AS relationship,
-                labels(connected)[0] AS connected_type,
-                connected.name AS connected_name,
-                connected.id AS connected_id
-            ORDER BY labels(connected)[0], type(r), connected.name
-            LIMIT {limit}
-            """)
-
-            summary = [{"entity_type": row[0], "count": row[1]} for row in (summary_result.result_set or [])]
-            connections = results_to_list(detail_result.result_set, detail_result.header) if detail_result.result_set else []
-            out = to_json({
-                "concept_id": concept_id,
-                "node_type_filter": node_type_filter,
-                "summary": summary,
-                "total_connections_shown": len(connections),
-                "connections": connections,
-            })
-            if len(out) > 50000:
-                out = out[:50000] + "\n... (truncated)"
-            return [TextContent(type="text", text=out)]
-
-        elif name == "list_graph_schema":
-            show_counts = arguments.get("show_counts", True)
-
-            if show_counts:
-                query = """
-                MATCH (n)
-                WITH labels(n)[0] AS node_type, COUNT(*) AS count
-                RETURN node_type, count
-                ORDER BY count DESC
-                """
-            else:
-                query = """
-                MATCH (n)
-                WITH DISTINCT labels(n)[0] AS node_type
-                RETURN node_type
-                ORDER BY node_type
-                """
-
-            result = graph.query(query)
-            rows = results_to_list(result.result_set, result.header) if result.result_set else []
-            return [TextContent(type="text", text=to_json({"schema": rows}))]
-
-        elif name == "find_highly_connected_variables":
-            min_connections = arguments.get("min_connections", 10)
-            limit = arguments.get("limit", 20)
-
-            query = f"""
-            MATCH (v:`biolink.StudyVariable`)--(c)
-            WITH v, COUNT(DISTINCT c) AS connection_count
-            WHERE connection_count >= {min_connections}
-            RETURN v.name AS variable_name, v.id AS variable_id, connection_count
-            ORDER BY connection_count DESC
-            LIMIT {limit}
-            """
-
-            result = graph.query(query)
-            rows = results_to_list(result.result_set, result.header) if result.result_set else []
-            return [TextContent(type="text", text=to_json({
-                "min_connections": min_connections,
-                "total_results": len(rows),
-                "variables": rows,
-            }))]
-
-        elif name == "search_variables_by_name":
-            search_term = arguments["search_term"]
-            limit = arguments.get("limit", 20)
-
-            query = f"""
-            MATCH (v:`biolink.StudyVariable`)
-            WHERE v.name CONTAINS '{search_term}' OR v.id CONTAINS '{search_term}'
-            RETURN v.id AS variable_id, v.name AS variable_name
-            LIMIT {limit}
-            """
-
-            result = graph.query(query)
-            rows = results_to_list(result.result_set, result.header) if result.result_set else []
-            out = to_json({"search_term": search_term, "total_results": len(rows), "variables": rows})
-            if len(out) > 50000:
-                out = out[:50000] + "\n... (truncated)"
-            return [TextContent(type="text", text=out)]
-
-        elif name == "expand_concept":
-            concept_id = arguments["concept_id"]
-            max_hops = min(arguments.get("max_hops", 2), 3)
-            relationship_types = arguments.get("relationship_types")
-            limit = arguments.get("limit", 50)
-
-            if relationship_types and len(relationship_types) > 0:
-                query = f"""
-                MATCH path = (source {{id: "{concept_id}"}})-[r*1..{max_hops}]-(expanded)
-                WHERE source <> expanded
-                  AND ALL(rel in relationships(path) WHERE type(rel) IN {relationship_types})
-                WITH expanded,
-                     labels(expanded)[0] AS expanded_type,
-                     length(path) AS hops,
-                     [rel in relationships(path) | type(rel)] AS path_relationships
-                RETURN DISTINCT
-                    expanded.id AS concept_id,
-                    expanded.name AS concept_name,
-                    expanded_type,
-                    hops,
-                    path_relationships
-                ORDER BY hops, expanded.name
-                LIMIT {limit}
-                """
-            else:
-                query = f"""
-                MATCH path = (source {{id: "{concept_id}"}})-[r*1..{max_hops}]-(expanded)
-                WHERE source <> expanded
-                WITH expanded,
-                     labels(expanded)[0] AS expanded_type,
-                     length(path) AS hops,
-                     [rel in relationships(path) | type(rel)] AS path_relationships
-                RETURN DISTINCT
-                    expanded.id AS concept_id,
-                    expanded.name AS concept_name,
-                    expanded_type,
-                    hops,
-                    path_relationships
-                ORDER BY hops, expanded.name
-                LIMIT {limit}
-                """
-
-            result = graph.query(query)
-            rows = results_to_list(result.result_set, result.header) if result.result_set else []
-            out = to_json({
-                "concept_id": concept_id,
-                "max_hops": max_hops,
-                "relationship_types": relationship_types,
-                "total_results": len(rows),
-                "expanded": rows,
-            })
-            if len(out) > 50000:
-                out = out[:50000] + "\n... (truncated)"
-            return [TextContent(type="text", text=out)]
-
-        elif name == "find_concept_paths":
-            source_id = arguments["source_id"]
-            target_id = arguments["target_id"]
-            max_path_length = min(arguments.get("max_path_length", 3), 5)
-            limit = arguments.get("limit", 10)
-
-            # Find shortest paths between concepts
-            query = f"""
-            MATCH path = shortestPath((source {{id: "{source_id}"}})-[*1..{max_path_length}]-(target {{id: "{target_id}"}}))
-            WITH path, length(path) AS path_length
-            UNWIND nodes(path) AS node
-            UNWIND relationships(path) AS rel
-            WITH path, path_length,
-                 collect(DISTINCT node.name) AS node_names,
-                 collect(DISTINCT type(rel)) AS relationship_types
-            RETURN
-                path_length,
-                node_names,
-                relationship_types
-            ORDER BY path_length
-            LIMIT {limit}
-            """
-
-            result = graph.query(query)
-            rows = results_to_list(result.result_set, result.header) if result.result_set else []
-            out = to_json({
-                "source_id": source_id,
-                "target_id": target_id,
-                "max_path_length": max_path_length,
-                "total_paths": len(rows),
-                "paths": rows,
-            })
-            if len(out) > 50000:
-                out = out[:50000] + "\n... (truncated)"
-            return [TextContent(type="text", text=out)]
-
-        elif name == "picsure_search":
-            phv_ids  = arguments.get("phv_ids", [])
-            keyword  = arguments.get("keyword", "")
-            semantic = arguments.get("semantic", True)
-            limit    = arguments.get("limit", 20)
-
-            if not phv_ids and not keyword:
-                return [TextContent(type="text", text=to_json({"error": "Provide phv_ids or keyword"}))]
-
-            enrichment_info = None
-            warnings = []
-            original_keyword = keyword  # preserve for output
-            phv_to_concepts: dict = {}
-
-            # Semantic mode: enrich keyword → KG → phv IDs, then PIC-SURE path lookup
-            if keyword and semantic:
-                synonyms = await fetch_synonyms(keyword)
-                curies = synonyms["curies"]
-                labels = synonyms["labels"]
-                warnings.extend(synonyms.get("warnings", []))
-                enrichment_info = {"curies": curies, "labels": labels}
-
-                where_clauses = []
-                if curies:
-                    curie_list = ", ".join(f'"{c}"' for c in curies)
-                    where_clauses.append(f"concept.id IN [{curie_list}]")
-                if labels:
-                    label_list = ", ".join(f'"{l}"' for l in labels)
-                    where_clauses.append(f"concept.name IN [{label_list}]")
-                if not where_clauses:
-                    where_clauses.append(f"concept.name CONTAINS '{keyword}'")
-                where_expr = " OR ".join(where_clauses)
-
-                kg_query = f"""
-                MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
-                WHERE ({where_expr})
-                  AND NOT labels(concept)[0] = 'biolink.StudyVariable'
-                RETURN DISTINCT v.id AS variable_id, concept.id AS concept_id, concept.name AS concept_name
-                LIMIT {limit * 5}
-                """
-                kg_result = graph.query(kg_query)
-                kg_rows = results_to_list(kg_result.result_set, kg_result.header) if kg_result.result_set else []
-
-                kg_phv_ids = []
-                phv_to_concepts: dict = {}
-                for row in kg_rows:
-                    vid = row.get("variable_id") or ""
-                    phv = vid.split(".")[0] if "." in vid else vid
-                    if not phv.startswith("phv"):
-                        continue
-                    if phv not in phv_to_concepts:
-                        phv_to_concepts[phv] = []
-                        kg_phv_ids.append(phv)
-                    concept_entry = {"concept_id": row.get("concept_id"), "concept_name": row.get("concept_name")}
-                    if concept_entry not in phv_to_concepts[phv]:
-                        phv_to_concepts[phv].append(concept_entry)
-
-                phv_ids = list(dict.fromkeys(list(phv_ids) + kg_phv_ids))
-                keyword = ""  # phv IDs now drive the PIC-SURE lookup
-
-            # Strip version suffixes: "phv00425822.v1.p1" → "phv00425822"
-            search_terms = [pid.split(".")[0] if "." in pid else pid for pid in phv_ids]
-            if keyword:
-                search_terms.append(keyword)
-            search_terms = list(dict.fromkeys(search_terms))  # deduplicate
-
-            results = []
-            seen_paths: set = set()
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                responses = await asyncio.gather(*[
-                    client.post(PICSURE_SEARCH_URL, json={"query": term})
-                    for term in search_terms
-                ], return_exceptions=True)
-
-            for term, resp in zip(search_terms, responses):
-                if len(results) >= limit:
-                    break
-                if isinstance(resp, Exception):
-                    warnings.append(f"PIC-SURE search failed for '{term}': {resp}")
-                    continue
-                if resp.status_code != 200:
-                    warnings.append(f"PIC-SURE returned HTTP {resp.status_code} for '{term}'")
-                    continue
-                try:
-                    phenotypes = resp.json().get("results", {}).get("phenotypes", {})
-                    for path, meta in phenotypes.items():
-                        if len(results) >= limit:
-                            break
-                        if path in seen_paths:
-                            continue
-                        seen_paths.add(path)
-                        parts = [p for p in path.strip("\\").split("\\") if p]
-                        study = parts[0] if parts else None
-                        phv   = next((p for p in parts if p.startswith("phv")), None)
-                        vname = parts[-1] if len(parts) > 1 else None
-                        cat_values = meta.get("categoryValues", [])
-                        result_entry = {
-                            "picsure_path": path,
-                            "study": study,
-                            "phv_id": phv,
-                            "variable_name": vname,
-                            "categorical": meta.get("categorical"),
-                            "category_values": cat_values[:20],
-                            "total_category_values": len(cat_values),
-                        }
-                        if phv and phv in phv_to_concepts:
-                            result_entry["matched_concepts"] = phv_to_concepts[phv]
-                        results.append(result_entry)
-                except Exception as e:
-                    warnings.append(f"Failed to parse PIC-SURE response for '{term}': {e}")
-
-            out = to_json({
-                "keyword": original_keyword if original_keyword else None,
-                "mode": "semantic" if (original_keyword and semantic) else "direct",
-                **({"enrichment": enrichment_info} if enrichment_info else {}),
-                "total_variables_found": len(results),
-                "variables": results,
-                **({"warnings": warnings} if warnings else {}),
-            })
-            if len(out) > 50000:
-                out = out[:50000] + "\n... (truncated)"
-            return [TextContent(type="text", text=out)]
-
-        elif name == "find_cohort_variables":
-            concepts = arguments.get("concepts", [])
-            variables_per_concept = arguments.get("variables_per_concept", 20)
-            limit = arguments.get("limit", 10)
-
-            if not concepts:
-                return [TextContent(type="text", text=to_json({"error": "Provide at least one concept"}))]
-
-            # Step 1: Parallel synonym enrichment for all concepts
-            enrichments = await asyncio.gather(*[
-                fetch_synonyms(c) for c in concepts
-            ], return_exceptions=True)
-
-            all_warnings = []
-            concept_data = []
-            for concept, enrichment in zip(concepts, enrichments):
-                if isinstance(enrichment, Exception):
-                    all_warnings.append(f"Enrichment failed for '{concept}': {enrichment}")
-                    curies, labels = [], [concept]
-                else:
-                    curies = enrichment["curies"]
-                    labels = enrichment["labels"]
-                    all_warnings.extend(enrichment.get("warnings", []))
-                concept_data.append({"concept": concept, "curies": curies, "labels": labels, "variables": []})
-
-            # Step 2: KG query per concept to get linked StudyVariables
-            for cdata in concept_data:
-                where_clauses = []
-                if cdata["curies"]:
-                    curie_list = ", ".join(f'"{c}"' for c in cdata["curies"])
-                    where_clauses.append(f"concept.id IN [{curie_list}]")
-                if cdata["labels"]:
-                    label_list = ", ".join(f'"{l}"' for l in cdata["labels"])
-                    where_clauses.append(f"concept.name IN [{label_list}]")
-                if not where_clauses:
-                    where_clauses.append(f"concept.name CONTAINS '{cdata['concept']}'")
-                where_expr = " OR ".join(where_clauses)
-                kg_query = f"""
-                MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
-                WHERE ({where_expr})
-                  AND NOT labels(concept)[0] = 'biolink.StudyVariable'
-                RETURN DISTINCT v.id AS variable_id, v.name AS variable_name
-                LIMIT {variables_per_concept * 5}
-                """
-                try:
-                    kg_result = graph.query(kg_query)
-                    kg_rows = results_to_list(kg_result.result_set, kg_result.header) if kg_result.result_set else []
-                    seen_ids: set = set()
-                    for row in kg_rows:
-                        vid = row.get("variable_id")
-                        if vid and vid not in seen_ids:
-                            seen_ids.add(vid)
-                            cdata["variables"].append({"variable_id": vid, "variable_name": row.get("variable_name")})
-                            if len(cdata["variables"]) >= variables_per_concept:
-                                break
-                except Exception as e:
-                    all_warnings.append(f"KG query failed for '{cdata['concept']}': {e}")
-
-            # Step 3: Collect all phv IDs across all concepts; map phv → concepts
-            phv_to_concepts: dict = {}
-            for cdata in concept_data:
-                for var in cdata["variables"]:
-                    vid = var["variable_id"] or ""
-                    phv = vid.split(".")[0] if "." in vid else vid
-                    if phv.startswith("phv"):
-                        if phv not in phv_to_concepts:
-                            phv_to_concepts[phv] = []
-                        if cdata["concept"] not in phv_to_concepts[phv]:
-                            phv_to_concepts[phv].append(cdata["concept"])
-
-            all_phv_ids = list(phv_to_concepts.keys())
-
-            # Step 4: PIC-SURE lookup for all phv IDs in parallel
-            picsure_by_phv: dict = {}
-            if all_phv_ids:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    ps_responses = await asyncio.gather(*[
-                        client.post(PICSURE_SEARCH_URL, json={"query": phv})
-                        for phv in all_phv_ids
-                    ], return_exceptions=True)
-                for phv, resp in zip(all_phv_ids, ps_responses):
-                    if isinstance(resp, Exception) or getattr(resp, "status_code", 0) != 200:
-                        continue
-                    try:
-                        phenotypes = resp.json().get("results", {}).get("phenotypes", {})
-                        entries = []
-                        for path, meta in list(phenotypes.items())[:5]:
-                            parts = [p for p in path.strip("\\").split("\\") if p]
-                            study = parts[0] if parts else None
-                            if not (study and study.startswith("phs")):
-                                continue
-                            cat_values = meta.get("categoryValues", [])
-                            entries.append({
-                                "picsure_path": path,
-                                "study": study,
-                                "variable_name": parts[-1] if len(parts) > 1 else None,
-                                "categorical": meta.get("categorical"),
-                                "category_values": cat_values[:10],
-                            })
-                        if entries:
-                            picsure_by_phv[phv] = entries
-                    except Exception as e:
-                        all_warnings.append(f"PIC-SURE parse failed for '{phv}': {e}")
-
-            # Step 5: Group by study; find intersection of concepts per study
-            study_concepts: dict = {}   # study → set of concept names
-            study_variables: dict = {}  # study → list of variable entries
-            for phv, entries in picsure_by_phv.items():
-                for entry in entries:
-                    study = entry["study"]
-                    if study not in study_concepts:
-                        study_concepts[study] = set()
-                        study_variables[study] = []
-                    for c in phv_to_concepts.get(phv, []):
-                        study_concepts[study].add(c)
-                    existing_paths = {v["picsure_path"] for v in study_variables[study]}
-                    if entry["picsure_path"] not in existing_paths:
-                        study_variables[study].append({
-                            "phv_id": phv,
-                            "matched_concepts": phv_to_concepts.get(phv, []),
-                            **entry,
-                        })
-
-            all_concept_names = set(cdata["concept"] for cdata in concept_data)
-            feasible_studies = []
-            partial_studies = []
-            for study, concepts_present in sorted(study_concepts.items(), key=lambda x: len(x[1]), reverse=True):
-                missing = all_concept_names - concepts_present
-                entry = {
-                    "study": study,
-                    "concepts_found": sorted(concepts_present),
-                    "concepts_missing": sorted(missing),
-                    "variables": study_variables[study],
-                }
-                if not missing:
-                    feasible_studies.append(entry)
-                else:
-                    partial_studies.append(entry)
-
-            feasible_studies = feasible_studies[:limit]
-            partial_studies = partial_studies[:5]
-
-            # Build a PIC-SURE query template from the best feasible study
-            picsure_query_template = None
-            if feasible_studies:
-                best = feasible_studies[0]
-                category_filters = {}
-                for var in best["variables"]:
-                    path = var["picsure_path"]
-                    if var.get("categorical") and var.get("category_values"):
-                        category_filters[path] = var["category_values"]
-                    elif var.get("categorical"):
-                        category_filters[path] = ["Yes", "1", "TRUE"]
-                picsure_query_template = {
-                    "resourceUUID": "02e23f52-f354-4e8b-992c-d37c8b9ba140",
-                    "query": {
-                        "expectedResultType": "COUNT",
-                        "categoryFilters": category_filters,
-                        "numericFilters": {},
-                        "requiredFields": [],
-                    },
-                    "note": (
-                        f"Submit to POST /query/sync on PIC-SURE with your BDC auth token. "
-                        f"Study: {best['study']}"
-                    ),
-                }
-
-            out = to_json({
-                "concepts_searched": [cdata["concept"] for cdata in concept_data],
-                "enrichment_summary": [
-                    {
-                        "concept": cdata["concept"],
-                        "curies_found": len(cdata["curies"]),
-                        "variables_in_kg": len(cdata["variables"]),
-                    }
-                    for cdata in concept_data
-                ],
-                "feasible_studies_count": len(feasible_studies),
-                "feasible_studies": feasible_studies,
-                "partial_studies": partial_studies,
-                **({"picsure_query_template": picsure_query_template} if picsure_query_template else {}),
-                **({"warnings": all_warnings} if all_warnings else {}),
-            })
-            if len(out) > 50000:
-                out = out[:50000] + "\n... (truncated)"
-            return [TextContent(type="text", text=out)]
-
-        else:
+        handler  = _TOOL_HANDLERS.get(name)
+        if handler is None:
             return [TextContent(type="text", text=to_json({"error": f"Unknown tool: {name}"}))]
-
+        return await handler(arguments, graph)
     except Exception as e:
         return [TextContent(type="text", text=to_json({"error": f"Error executing tool '{name}': {str(e)}"}))]
 
 
+# ---------------------------------------------------------------------------
+# Transport
+# ---------------------------------------------------------------------------
+
 def create_sse_app():
-    """Create a plain ASGI app that serves the MCP server over SSE"""
+    """Create a plain ASGI app that serves the MCP server over SSE."""
     sse = SseServerTransport("/messages/")
 
     async def asgi_app(scope, receive, send):
