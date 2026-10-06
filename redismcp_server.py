@@ -899,7 +899,7 @@ async def _handle_cypher_query(arguments: dict, graph) -> list[TextContent]:
         rows = results_to_list(result.result_set, result.header)
         out = _truncate(to_json({
             "rows_returned": len(rows),
-            "execution_time_ms": result.execution_time,
+            "execution_time_ms": getattr(result, "execution_time", None),
             "results": rows,
         }))
         return [TextContent(type="text", text=out)]
@@ -1210,17 +1210,14 @@ async def _handle_find_concept_paths(arguments: dict, graph) -> list[TextContent
     limit           = arguments.get("limit", 10)
 
     query = f"""
-    MATCH path = shortestPath((source {{id: "{source_id}"}})-[*1..{max_path_length}]-(target {{id: "{target_id}"}}))
-    WITH path, length(path) AS path_length
-    UNWIND nodes(path) AS node
-    UNWIND relationships(path) AS rel
-    WITH path, path_length,
-         collect(DISTINCT node.name) AS node_names,
-         collect(DISTINCT type(rel)) AS relationship_types
+    MATCH (source {{id: "{source_id}"}}), (target {{id: "{target_id}"}})
+    WITH source, target
+    WITH shortestPath((source)-[*1..{max_path_length}]-(target)) AS path
+    WHERE path IS NOT NULL
     RETURN
-        path_length,
-        node_names,
-        relationship_types
+        length(path) AS path_length,
+        [n IN nodes(path) | n.name] AS node_names,
+        [r IN relationships(path) | type(r)] AS relationship_types
     ORDER BY path_length
     LIMIT {limit}
     """
