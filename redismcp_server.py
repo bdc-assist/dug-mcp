@@ -224,6 +224,28 @@ def to_json(data) -> str:
     return json.dumps(data, indent=2, default=str)
 
 
+def _build_sources(studies: list) -> list:
+    """Build a _sources list from dicts containing study_id and study_name.
+    Deduplicates by base study accession and strips version suffixes for the URL.
+    """
+    seen    = set()
+    sources = []
+    for s in studies:
+        sid = s.get("study_id") or s.get("study")
+        if not sid:
+            continue
+        base_id = sid.split(".")[0]  # phs000007.v34.p15 → phs000007
+        if base_id in seen:
+            continue
+        seen.add(base_id)
+        sources.append({
+            "title": s.get("study_name") or base_id,
+            "link":  f"https://www.ncbi.nlm.nih.gov/projects/gap/cgi-bin/study.cgi?study_id={base_id}",
+            "type":  "dbgap-study",
+        })
+    return sources
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
@@ -899,12 +921,13 @@ async def _handle_search_concepts(arguments: dict, graph) -> list[TextContent]:
 
         where_expr = _build_synonym_where(curies, labels, search_term)
 
-        # Fetch all (variable, concept, predicate) matches — no LIMIT here.
+        # Fetch all (variable, concept, predicate, study) matches — no LIMIT here.
         # Dedup is done in Python after grouping by variable_id.
         query = f"""
         MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
         WHERE ({where_expr})
           AND NOT labels(concept)[0] = 'biolink.StudyVariable'
+        OPTIONAL MATCH (v)-[]-(s:`biolink.Study`)
         RETURN
             v.id AS variable_id,
             v.name AS variable_name,
@@ -912,14 +935,17 @@ async def _handle_search_concepts(arguments: dict, graph) -> list[TextContent]:
             concept.id AS concept_id,
             concept.name AS concept_name,
             labels(concept)[0] AS concept_type,
-            type(r) AS predicate
+            type(r) AS predicate,
+            s.id AS study_id,
+            s.name AS study_name
         """
         result = graph.query(query)
         rows = results_to_list(result.result_set, result.header) if result.result_set else []
 
         # Group by variable_id — one entry per unique variable,
         # with a matched_concepts list showing which concepts and predicates matched.
-        variables: dict = {}
+        variables:    dict = {}
+        study_lookup: dict = {}   # study_id → study_name, for _sources
         for row in rows:
             vid = row["variable_id"]
             if vid not in variables:
@@ -941,12 +967,18 @@ async def _handle_search_concepts(arguments: dict, graph) -> list[TextContent]:
                     "concept_type": row["concept_type"].replace("biolink.", "biolink:") if row.get("concept_type") else None,
                     "predicate": predicate,
                 })
+            if row.get("study_id") and row["study_id"] not in study_lookup:
+                study_lookup[row["study_id"]] = row.get("study_name")
 
         # Sort by number of matched concepts descending (relevance proxy),
         # then apply limit on unique variables.
         unique_vars = sorted(variables.values(), key=lambda v: len(v["matched_concepts"]), reverse=True)
         unique_vars = unique_vars[:limit]
 
+        sources = _build_sources([
+            {"study_id": sid, "study_name": sname}
+            for sid, sname in study_lookup.items()
+        ])
         out = _truncate(to_json({
             "search_term": search_term,
             "enrichment": {
@@ -956,6 +988,7 @@ async def _handle_search_concepts(arguments: dict, graph) -> list[TextContent]:
             },
             "total_results": len(unique_vars),
             "variables": unique_vars,
+            **({"_sources": sources} if sources else {}),
         }))
         return [TextContent(type="text", text=out)]
 
@@ -1017,11 +1050,13 @@ async def _handle_get_concept_graph(arguments: dict, graph) -> list[TextContent]
         for row in rows:
             if row.get("concept_type"):
                 row["concept_type"] = row["concept_type"].replace("biolink.", "biolink:")
+        sources = _build_sources(rows)
         out = _truncate(to_json({
             "concept_id": concept_id,
             "expand_depth": expand_depth,
             "total_results": len(rows),
             "graph": rows,
+            **({"_sources": sources} if sources else {}),
         }))
         return [TextContent(type="text", text=out)]
     else:
@@ -1432,6 +1467,10 @@ async def _handle_find_cohort_variables(arguments: dict, graph) -> list[TextCont
     feasible_studies = feasible_studies[:limit]
     partial_studies  = partial_studies[:5]
 
+    sources = _build_sources([
+        {"study_id": e["study_id"], "study_name": e.get("study_name")}
+        for e in feasible_studies + partial_studies
+    ])
     out = _truncate(to_json({
         "concepts_searched": [cdata["concept"] for cdata in concept_data],
         "enrichment_summary": [
@@ -1445,6 +1484,7 @@ async def _handle_find_cohort_variables(arguments: dict, graph) -> list[TextCont
         "feasible_studies_count": len(feasible_studies),
         "feasible_studies": feasible_studies,
         "partial_studies":  partial_studies,
+        **({"_sources": sources} if sources else {}),
         **({"warnings": all_warnings} if all_warnings else {}),
     }))
     return [TextContent(type="text", text=out)]
