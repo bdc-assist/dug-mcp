@@ -1209,18 +1209,28 @@ async def _handle_find_concept_paths(arguments: dict, graph) -> list[TextContent
     max_path_length = min(arguments.get("max_path_length", 3), 5)
     limit           = arguments.get("limit", 10)
 
-    query = f"""
-    MATCH p = (source {{id: "{source_id}"}})-[*1..{max_path_length}]-(target {{id: "{target_id}"}})
-    RETURN
-        length(p) AS path_length,
-        [n IN nodes(p) | n.name] AS node_names,
-        [r IN relationships(p) | type(r)] AS relationship_types
-    ORDER BY path_length
-    LIMIT {limit}
-    """
+    # FalkorDB only supports directed shortestPath — try forward then reverse.
+    rows = []
+    for src, tgt in [(source_id, target_id), (target_id, source_id)]:
+        q = f"""
+        MATCH (source {{id: "{src}"}}), (target {{id: "{tgt}"}})
+        WITH source, target
+        WITH shortestPath((source)-[*1..{max_path_length}]->(target)) AS path
+        WHERE path IS NOT NULL
+        RETURN
+            length(path) AS path_length,
+            [n IN nodes(path) | n.name] AS node_names,
+            [r IN relationships(path) | type(r)] AS relationship_types
+        LIMIT {limit}
+        """
+        try:
+            result = graph.query(q)
+            if result.result_set:
+                rows.extend(results_to_list(result.result_set, result.header))
+                break  # found paths — no need to try reverse
+        except Exception:
+            pass  # direction had no path; try the other
 
-    result = graph.query(query)
-    rows = results_to_list(result.result_set, result.header) if result.result_set else []
     out = _truncate(to_json({
         "source_id": source_id,
         "target_id": target_id,
