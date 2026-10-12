@@ -173,10 +173,11 @@ Example response shape for `find_variables=true`:
 
 ### `get_concept_graph`
 
-Get the subgraph around a concept.
+Get the subgraph around a concept. Also works when the starting node is a **variable** (`phv…` or `phs…_…`) — in that case the query is flipped to return the concepts and study the variable belongs to.
 
 - **Depth 1** — returns all directly connected nodes of any type
 - **Depth 2** — traverses concept → StudyVariable → Study, with a count of how many other concepts each variable links to
+- **Variable as input** — returns concepts linked to the variable and its parent study
 
 **Direct neighbors:**
 ```json
@@ -188,11 +189,16 @@ Get the subgraph around a concept.
 { "concept_id": "MONDO:0004979", "expand_depth": 2, "limit": 50 }
 ```
 
+**Starting from a variable:**
+```json
+{ "concept_id": "phv00425822.v1.p1", "expand_depth": 2 }
+```
+
 ---
 
 ### `get_concept_connections`
 
-List every entity directly connected to a node — relationship type, node type, name, and ID. Returns a type-count summary plus the full leaf-node list. Also works with variable IDs. Optionally filter by node type.
+List every entity directly connected to a node — relationship direction (`in`/`out`), relationship type (in `biolink:` notation), node type, name, and ID. Also returns the **concept name** and a type-count summary. Works with both concept CURIEs and variable IDs. Optionally filter by node type.
 
 **All connections:**
 ```json
@@ -260,17 +266,31 @@ Traverse the concept graph N hops from a starting node, returning related concep
 
 ### `find_concept_paths`
 
-Find the shortest path(s) between two biomedical concepts.
+Find the shortest path(s) between two biomedical concepts. The path is tried in both directions (forward then reverse) since FalkorDB only supports directed `shortestPath`.
 
 ```json
 {
   "source_id": "MONDO:0004979",
-  "target_id": "MONDO:0004784",
+  "target_id": "CHEBI:28534",
   "max_path_length": 3
 }
 ```
 
-Returns the node names and relationship types along each path.
+Returns `node_ids`, `node_names`, `node_types`, and `relationship_types` for each hop along the path. Example result:
+
+```json
+{
+  "total_paths": 1,
+  "paths": [
+    {
+      "path_length": 2,
+      "node_ids":   ["MONDO:0004979", "NCBIGene:2944", "CHEBI:28534"],
+      "node_names": ["asthma", "HSP90AA1", "homogentisic acid"],
+      "node_types": ["biolink.NamedThing", "biolink.NamedThing", "biolink.NamedThing"],
+      "relationship_types": ["biolink.related_to", "biolink.related_to"]
+    }
+  ]
+}
 
 ---
 
@@ -369,9 +389,9 @@ search_concepts(find_variables=true) → picsure_search(phv_ids) → PIC-SURE /q
 
 Find study variables for **multiple biomedical concepts simultaneously** and identify which studies contain variables for all of them — the core tool for multi-condition cohort feasibility analysis.
 
-For each concept, synonym enrichment finds matching variables in the KG. Variables are then looked up in PIC-SURE. Studies are grouped by which concepts they cover: `feasible_studies` have variables for all concepts; `partial_studies` are missing at least one.
+For each concept, synonym enrichment finds matching variables in the KG. Variables are then resolved to studies directly via the Knowledge Graph (no PIC-SURE dependency). Studies are grouped by which concepts they cover: `feasible_studies` have variables for all concepts; `partial_studies` are missing at least one.
 
-A ready-to-submit PIC-SURE query template is generated for the best feasible study.
+Each variable's `matched_concepts` entry carries both the concept name and the top enriched CURIEs used to find it.
 
 **Asthma AND obesity cohort:**
 ```json
@@ -386,36 +406,43 @@ A ready-to-submit PIC-SURE query template is generated for the best feasible stu
 Example response shape:
 ```json
 {
-  "concepts_searched": ["asthma", "obesity"],
+  "concepts_searched": ["asthma", "COPD"],
   "enrichment_summary": [
     { "concept": "asthma", "curies_found": 12, "variables_in_kg": 20 },
-    { "concept": "obesity", "curies_found": 8, "variables_in_kg": 18 }
+    { "concept": "COPD",   "curies_found": 8,  "variables_in_kg": 15 }
   ],
-  "feasible_studies_count": 3,
+  "feasible_studies_count": 2,
   "feasible_studies": [
     {
-      "study": "phs000285",
-      "concepts_found": ["asthma", "obesity"],
+      "study_id":        "phs000007.v31.p12",
+      "study_name":      "Framingham Cohort",
+      "concepts_found":  ["asthma", "COPD"],
       "concepts_missing": [],
-      "variables": [...]
+      "variables": [
+        {
+          "variable_id":   "phv00009088.v9.p15",
+          "variable_name": "D360",
+          "study_id":      "phs000007.v31.p12",
+          "matched_concepts": [
+            {
+              "concept": "asthma",
+              "curies":  ["MONDO:0004979", "MONDO:0004784", "MONDO:0001491"]
+            }
+          ]
+        }
+      ]
     }
   ],
   "partial_studies": [...],
-  "picsure_query_template": {
-    "resourceUUID": "02e23f52-f354-4e8b-992c-d37c8b9ba140",
-    "query": {
-      "expectedResultType": "COUNT",
-      "categoryFilters": { "\\phs000285\\...\\phv00425822\\p_asth\\": ["Yes"] },
-      "numericFilters": {}
-    },
-    "note": "Submit to POST /query/sync with your BDC auth token. Study: phs000285"
-  }
+  "_sources": [
+    { "title": "Framingham Cohort", "link": "https://www.ncbi.nlm.nih.gov/projects/gap/cgi-bin/study.cgi?study_id=phs000007", "type": "dbgap-study" }
+  ]
 }
 ```
 
 **Recommended chain for multi-condition cohort building:**
 ```
-find_cohort_variables(concepts) → review feasible_studies → submit picsure_query_template to PIC-SURE /query/sync
+find_cohort_variables(concepts) → review feasible_studies → use variable IDs with picsure_search → PIC-SURE /query/sync
 ```
 
 ---
@@ -435,6 +462,26 @@ MATCH (v:`biolink.StudyVariable` {id: "phv00430345.v1.p1"})--(c)
 RETURN labels(c)[0] AS type, c.name AS name, c.id AS id
 LIMIT 20
 ```
+
+---
+
+## Provenance — `_sources`
+
+Every tool that touches study data appends a `_sources` array to its response. Each entry is a dbGaP study link:
+
+```json
+"_sources": [
+  {
+    "title": "Framingham Cohort",
+    "link":  "https://www.ncbi.nlm.nih.gov/projects/gap/cgi-bin/study.cgi?study_id=phs000007",
+    "type":  "dbgap-study"
+  }
+]
+```
+
+This makes provenance machine-readable and uniform across all tools — downstream agents or UIs can aggregate `_sources` from multiple tool calls to show a consolidated list of studies that contributed to an answer, without needing to parse each tool's specific response structure.
+
+Tools that emit `_sources`: `search_concepts`, `get_concept_graph`, `find_cohort_variables`.
 
 ---
 
