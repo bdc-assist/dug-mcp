@@ -9,13 +9,13 @@ This server exposes a biomedical knowledge graph as MCP tools and prompts, enabl
 - Search for diseases, phenotypes, and other biomedical concepts by name
 - Enrich searches with synonyms using [Name Resolution SRI](https://name-resolution-sri.renci.org) and [SAP-BERT](https://github.com/cambridgeltl/sapbert)
 - Discover study variables connected to a concept via **semantic biolink relationships** — not keyword matching
-- Look up variable paths in [BioData Catalyst PIC-SURE](https://picsure.biodatacatalyst.nhlbi.nih.gov/) to enable cohort building
+- Identify studies feasible for multi-condition cohort analysis
 - Traverse concept relationships and find paths between entities
 - Execute TRAPI and raw Cypher queries for advanced use cases
 
 ## How Variable Discovery Works
 
-The key design principle: **the Knowledge Graph decides which variables are relevant. PIC-SURE confirms the data exists.**
+The key design principle: **the Knowledge Graph decides which variables are relevant.**
 
 ```
 Natural language query: "asthma"
@@ -34,16 +34,12 @@ Natural language query: "asthma"
       are returned. No keyword noise.
             │
             ▼
-  Step 3 — PIC-SURE Path Lookup (picsure_search)
-    phv IDs → full BDC variable paths
-    → Confirms the variable exists in BDC data
-            │
-            ▼
-  Step 4 — Cohort Query (with BDC auth token)
-    PIC-SURE /query/sync → participant count
+  Step 3 — Study Resolution
+    Variable IDs → Study nodes via KG edges
+    → Returns study names, IDs, and matched concepts
 ```
 
-This pipeline is fundamentally different from PIC-SURE keyword search: a variable only reaches PIC-SURE if the Knowledge Graph has established a semantic relationship between the concept and that variable via a biolink edge.
+A variable only appears in results if the Knowledge Graph has established a semantic relationship between the concept and that variable via a biolink edge.
 
 ## Architecture
 
@@ -59,13 +55,11 @@ User / Claude Desktop / API Client
     redis-mcp-server  (port 8000)
       - MCP tools and prompts over SSE
       - Synonym enrichment: Name Resolution SRI + SAP-BERT
-      - KG semantic variable discovery
-      - PIC-SURE path lookup (open resource, no auth)
+      - KG semantic variable and study discovery
             │
-            ├──────────────────────┐
-            ▼                      ▼
-      Redis (RedisGraph)     PIC-SURE API
-      Knowledge Graph        BioData Catalyst
+            ▼
+      Redis (RedisGraph)
+      Knowledge Graph (FalkorDB)
 ```
 
 ---
@@ -343,44 +337,30 @@ The `cypher_used` field in the response shows the generated Cypher for transpare
 
 ---
 
-### `picsure_search`
+### `find_variables`
 
-Look up BioData Catalyst PIC-SURE variable paths by phv ID or keyword. Use this **after** `search_concepts` or `trapi_query` to get the full PIC-SURE paths needed to build a cohort query. No authentication required — uses the open PIC-SURE resource.
+Find study variables semantically linked to a biomedical concept using the knowledge graph. Automatically enriches the keyword with synonyms and related CURIEs via Name Resolution SRI + SAP-BERT, then queries the KG to return only variables with a proven biolink relationship to the concept.
 
-**From phv IDs (chain after search_concepts):**
+**Use this when you have a keyword and want to discover which study variables relate to it.** Unlike `search_variables_by_name` (which matches on variable name text), this tool understands medical synonyms — searching "heart attack" also finds variables linked to "myocardial infarction", "MI", "STEMI", etc.
+
+**By keyword (semantic enrichment, default):**
+```json
+{ "keyword": "asthma", "semantic": true, "limit": 20 }
+```
+
+**By phv IDs (look up specific variables in the KG):**
 ```json
 { "phv_ids": ["phv00425822", "phv00347788"], "limit": 20 }
 ```
 
-**By keyword (direct lookup):**
+**By keyword, literal match only:**
 ```json
-{ "keyword": "asthma", "limit": 10 }
+{ "keyword": "asthma", "semantic": false, "limit": 10 }
 ```
 
-Example response:
-```json
-{
-  "total_variables_found": 1,
-  "variables": [
-    {
-      "search_term": "phv00425822",
-      "picsure_path": "\\phs001514\\pht009816\\phv00425822\\p_asth\\",
-      "study": "phs001514",
-      "phv_id": "phv00425822",
-      "variable_name": "p_asth",
-      "categorical": true,
-      "category_values": ["Yes"],
-      "total_category_values": 1
-    }
-  ]
-}
+**Recommended chain for single-concept variable discovery:**
 ```
-
-The `picsure_path` is the exact path to use in a PIC-SURE cohort query. Submit it to the PIC-SURE `/query/sync` endpoint with your BDC auth token to get participant counts.
-
-**Recommended chain for cohort building:**
-```
-search_concepts(find_variables=true) → picsure_search(phv_ids) → PIC-SURE /query/sync
+find_variables(keyword) → review variables → use variable IDs with get_concept_connections or find_cohort_variables
 ```
 
 ---
@@ -442,7 +422,7 @@ Example response shape:
 
 **Recommended chain for multi-condition cohort building:**
 ```
-find_cohort_variables(concepts) → review feasible_studies → use variable IDs with picsure_search → PIC-SURE /query/sync
+find_cohort_variables(concepts) → review feasible_studies → use variable IDs with get_concept_connections or find_variables
 ```
 
 ---

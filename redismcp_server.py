@@ -586,11 +586,15 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="search_concepts",
             description=(
-                "Search for biomedical concepts by name, OR find StudyVariables related to a concept with synonym enrichment. "
+                "Search the knowledge graph for biomedical concepts (diseases, phenotypes, genes, chemicals) by name. "
+                "With find_variables=true, also returns StudyVariables semantically linked to the concept via synonym enrichment — "
+                "use this when the user provides a concept name and wants both the concept AND its related study variables in one call. "
                 "When find_variables=true, the search term is first expanded into synonyms and related concept identifiers "
                 "by querying two external services in parallel: "
-                "(1) Name Resolution SRI (https://name-resolution-sri.renci.org) — returns up to 10 normalized CURIEs and preferred labels; "
-                "(2) SAP-BERT Qdrant (https://sap-qdrant.example.com) — returns up to 10 semantically similar biomedical concepts. "
+                "(1) Name Resolution SRI — returns normalized CURIEs and preferred labels; "
+                "(2) SAP-BERT Qdrant — returns semantically similar biomedical concepts. "
+                "Use find_variables=false (default) when the goal is just to look up a concept node to get its CURIE ID. "
+                "Do NOT use this to search by variable name or phv ID — use search_variables_by_name for that. "
                 "The combined set of CURIEs and labels is then used to search the Redis knowledge graph for any StudyVariables "
                 "connected to those concepts, providing broader coverage than a simple name match."
             ),
@@ -622,7 +626,14 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_concept_graph",
-            description="Get the complete subgraph for a biomedical concept including studies, variables, and related entities",
+            description=(
+                "Retrieve the full subgraph around a known concept or variable CURIE — requires an ID, not a name. "
+                "Depth 2 (default) returns the concept, its linked StudyVariables, and the Studies those variables belong to, "
+                "with a count of how many other concepts each variable is linked to (relevance signal). "
+                "Also works in reverse: pass a variable ID (phv… or phs…_…) to see which concepts and study it belongs to. "
+                "Use this for graph exploration when you already have a CURIE. "
+                "Do NOT use this to search by name — use search_concepts first to get the CURIE, then call this."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -646,7 +657,14 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_concept_connections",
-            description="List all entities directly connected to a concept, showing the relationship type, connected node type, name, and ID. Use node_type_filter to focus on a specific entity type (e.g. only StudyVariables or only Studies).",
+            description=(
+                "List every entity directly connected to a concept or variable — one hop only, flat list. "
+                "Returns relationship direction (in/out), relationship type, connected node type, name, and ID. "
+                "Also returns a type-count summary so you can see at a glance how many Studies, Variables, Diseases, etc. are connected. "
+                "Use get_concept_connections when you want to enumerate neighbors with relationship detail. "
+                "Use get_concept_graph instead when you want a full depth-2 subgraph with study context. "
+                "Use node_type_filter to narrow results (e.g. 'StudyVariable', 'Study', 'Disease')."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -704,10 +722,11 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="search_variables_by_name",
             description=(
-                "Search for StudyVariables by free-text name or by ID prefix/pattern. "
-                "Unlike search_concepts, this searches only StudyVariable nodes and supports "
-                "partial ID matching (e.g. 'phv00430' returns all variables whose ID starts with that prefix). "
-                "Use this when you already know you want variables and have a name fragment or a partial phv ID."
+                "Search for StudyVariable nodes by variable name text or by phv ID prefix — literal text match, no semantic enrichment. "
+                "Use this when you have a specific variable name fragment (e.g. 'BMI', 'smoking') or a partial phv ID (e.g. 'phv00430'). "
+                "Unlike find_variables, this does NOT expand synonyms or use the concept graph — it matches directly on variable name/ID strings. "
+                "Unlike search_concepts, this returns only variables, never concept nodes. "
+                "Best for: looking up known variables by name, browsing variables in a study, or resolving a partial phv ID."
             ),
             inputSchema={
                 "type": "object",
@@ -783,15 +802,15 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
-            name="picsure_search",
+            name="find_variables",
             description=(
-                "Look up study variables in BioData Catalyst PIC-SURE by phv ID or keyword. "
-                "When semantic=true (default when keyword is provided), enriches the keyword via "
-                "Name Resolution SRI + SAP-BERT, queries the knowledge graph for semantically linked "
-                "variables, then looks up their PIC-SURE paths — finding variables related to "
-                "'myocardial infarction', 'MI', etc. when you search 'heart attack'. "
-                "When semantic=false, forwards the keyword directly to PIC-SURE (literal match only). "
-                "No authentication required — uses the open PIC-SURE resource."
+                "Find study variables semantically linked to a biomedical concept — the deepest single-concept variable discovery tool. "
+                "Given a keyword, enriches it via Name Resolution SRI + SAP-BERT to find related CURIEs, then queries the knowledge graph "
+                "for variables with a proven biolink relationship to those concepts. "
+                "Finds variables for 'heart attack' even if the variable is linked to 'myocardial infarction' or 'STEMI' in the graph. "
+                "Use this for single-concept discovery when you want maximum semantic recall. "
+                "Use find_cohort_variables instead when you need variables for MULTIPLE concepts and want to find studies that cover all of them. "
+                "Use search_variables_by_name instead when you have a known variable name fragment or phv ID prefix."
             ),
             inputSchema={
                 "type": "object",
@@ -810,12 +829,12 @@ async def list_tools() -> list[Tool]:
                     },
                     "semantic": {
                         "type": "boolean",
-                        "description": "If true (default), enrich keyword via Name Resolution SRI + SAP-BERT and query the KG before PIC-SURE lookup. If false, forward keyword directly to PIC-SURE as a literal search.",
+                        "description": "If true (default), enrich keyword via Name Resolution SRI + SAP-BERT and query the KG for semantically linked variables. If false, search using the keyword as a literal term.",
                         "default": True
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of variable paths to return",
+                        "description": "Maximum number of variables to return",
                         "default": 20
                     }
                 }
@@ -824,12 +843,13 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="find_cohort_variables",
             description=(
-                "Find study variables for multiple biomedical concepts simultaneously and identify "
-                "studies that contain variables for ALL specified concepts — enabling cohort feasibility analysis. "
-                "For each concept, synonym enrichment is used to find matching variables in the knowledge graph. "
-                "Returns feasible_studies (have all concepts) and partial_studies (missing some), with "
-                "PIC-SURE variable paths and a ready-to-submit PIC-SURE query template for the best study. "
-                "Use this to build multi-condition cohort queries (e.g. 'asthma AND obesity')."
+                "Assess cohort feasibility for MULTIPLE biomedical concepts simultaneously — the primary tool for multi-condition study planning. "
+                "For each concept, synonym enrichment finds semantically linked variables in the KG; variables are then resolved to studies via KG edges. "
+                "Returns feasible_studies (contain variables for ALL concepts) and partial_studies (missing at least one), "
+                "each with matched variables, study names, dbGaP IDs, and enriched CURIEs. "
+                "Use this when the question involves two or more conditions (e.g. 'which studies have both asthma AND obesity variables'). "
+                "Use find_variables instead for single-concept variable discovery. "
+                "Use search_concepts(find_variables=true) instead when you want concepts + variables in a single call for one concept."
             ),
             inputSchema={
                 "type": "object",
@@ -1556,7 +1576,7 @@ _TOOL_HANDLERS = {
     "search_variables_by_name":        _handle_search_variables_by_name,
     "expand_concept":                  _handle_expand_concept,
     "find_concept_paths":              _handle_find_concept_paths,
-    "picsure_search":                  _handle_picsure_search,
+    "find_variables":                  _handle_picsure_search,
     "find_cohort_variables":           _handle_find_cohort_variables,
 }
 
