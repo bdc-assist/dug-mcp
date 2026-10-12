@@ -1011,6 +1011,11 @@ async def _handle_search_concepts(arguments: dict, graph) -> list[TextContent]:
         return [TextContent(type="text", text=out)]
 
 
+def _is_variable_id(concept_id: str) -> bool:
+    """Return True if the id looks like a StudyVariable accession (phv… or phs…_…)."""
+    return concept_id.startswith("phv") or (concept_id.startswith("phs") and "_" in concept_id)
+
+
 async def _handle_get_concept_graph(arguments: dict, graph) -> list[TextContent]:
     concept_id   = arguments["concept_id"]
     expand_depth = min(arguments.get("expand_depth", 2), 3)
@@ -1024,6 +1029,27 @@ async def _handle_get_concept_graph(arguments: dict, graph) -> list[TextContent]
                labels(connected)[0] AS connected_type,
                connected.name AS connected_name,
                connected.id AS connected_id
+        LIMIT {limit}
+        """
+    elif _is_variable_id(concept_id):
+        # Starting from a StudyVariable — return the concepts it links to + its study
+        query = f"""
+        MATCH (variable:`biolink.StudyVariable` {{id: "{concept_id}"}})
+        OPTIONAL MATCH (variable)-[r1]-(concept)
+        WHERE NOT labels(concept)[0] = 'biolink.StudyVariable'
+          AND NOT labels(concept)[0] = 'biolink.Study'
+        OPTIONAL MATCH (variable)-[r2]-(study:`biolink.Study`)
+        OPTIONAL MATCH (concept)-[r3]-(related)
+        WHERE related <> variable
+        RETURN DISTINCT
+            concept.name AS concept,
+            concept.id AS concept_id,
+            labels(concept)[0] AS concept_type,
+            variable.name AS variable_name,
+            variable.id AS variable_id,
+            study.name AS study_name,
+            study.id AS study_id,
+            COUNT(DISTINCT related) AS related_concepts_count
         LIMIT {limit}
         """
     else:
@@ -1064,11 +1090,17 @@ async def _handle_get_concept_graph(arguments: dict, graph) -> list[TextContent]
 
 
 async def _handle_get_concept_connections(arguments: dict, graph) -> list[TextContent]:
-    concept_id      = arguments["concept_id"]
+    concept_id       = arguments["concept_id"]
     node_type_filter = arguments.get("node_type_filter")
-    limit           = arguments.get("limit", 50)
+    limit            = arguments.get("limit", 50)
 
     type_clause = f":`biolink.{node_type_filter}`" if node_type_filter else ""
+
+    # Fetch the concept name for display
+    name_result = graph.query(f'MATCH (n {{id: "{concept_id}"}}) RETURN n.name AS name LIMIT 1')
+    concept_name = None
+    if name_result.result_set:
+        concept_name = name_result.result_set[0][0]
 
     summary_result = graph.query(f"""
     MATCH (concept {{id: "{concept_id}"}})-[r]-(connected{type_clause})
@@ -1080,6 +1112,7 @@ async def _handle_get_concept_connections(arguments: dict, graph) -> list[TextCo
     detail_result = graph.query(f"""
     MATCH (concept {{id: "{concept_id}"}})-[r]-(connected{type_clause})
     RETURN
+        CASE WHEN startNode(r).id = "{concept_id}" THEN "out" ELSE "in" END AS direction,
         type(r) AS relationship,
         labels(connected)[0] AS connected_type,
         connected.name AS connected_name,
@@ -1090,8 +1123,16 @@ async def _handle_get_concept_connections(arguments: dict, graph) -> list[TextCo
 
     summary     = [{"entity_type": row[0], "count": row[1]} for row in (summary_result.result_set or [])]
     connections = results_to_list(detail_result.result_set, detail_result.header) if detail_result.result_set else []
+    # Normalize relationship dot → colon
+    for c in connections:
+        if c.get("relationship"):
+            c["relationship"] = c["relationship"].replace("biolink.", "biolink:")
+        if c.get("connected_type"):
+            c["connected_type"] = c["connected_type"].replace("biolink.", "biolink:")
+
     out = _truncate(to_json({
-        "concept_id": concept_id,
+        "concept_id":   concept_id,
+        "concept_name": concept_name,
         "node_type_filter": node_type_filter,
         "summary": summary,
         "total_connections_shown": len(connections),
@@ -1219,7 +1260,9 @@ async def _handle_find_concept_paths(arguments: dict, graph) -> list[TextContent
         WHERE path IS NOT NULL
         RETURN
             length(path) AS path_length,
+            [n IN nodes(path) | n.id]   AS node_ids,
             [n IN nodes(path) | n.name] AS node_names,
+            [n IN nodes(path) | labels(n)[0]] AS node_types,
             [r IN relationships(path) | type(r)] AS relationship_types
         LIMIT {limit}
         """
@@ -1403,7 +1446,7 @@ async def _handle_find_cohort_variables(arguments: dict, graph) -> list[TextCont
         except Exception as e:
             all_warnings.append(f"KG query failed for '{cdata['concept']}': {e}")
 
-    # Step 3: Build variable_id → concepts mapping
+    # Step 3: Build variable_id → concepts mapping (include CURIEs, not just search term)
     var_to_concepts: dict = {}
     for cdata in concept_data:
         for var in cdata["variables"]:
@@ -1411,8 +1454,12 @@ async def _handle_find_cohort_variables(arguments: dict, graph) -> list[TextCont
             if vid:
                 if vid not in var_to_concepts:
                     var_to_concepts[vid] = []
-                if cdata["concept"] not in var_to_concepts[vid]:
-                    var_to_concepts[vid].append(cdata["concept"])
+                entry = {
+                    "concept":  cdata["concept"],
+                    "curies":   cdata["curies"][:5],   # top 5 enriched CURIEs
+                }
+                if entry not in var_to_concepts[vid]:
+                    var_to_concepts[vid].append(entry)
 
     all_var_ids = list(var_to_concepts.keys())
 
@@ -1438,7 +1485,7 @@ async def _handle_find_cohort_variables(arguments: dict, graph) -> list[TextCont
                     study_concepts[study_id]  = set()
                     study_variables[study_id] = []
                 for c in var_to_concepts.get(vid, []):
-                    study_concepts[study_id].add(c)
+                    study_concepts[study_id].add(c["concept"])  # track by concept name string
                 existing = {v["variable_id"] for v in study_variables[study_id]}
                 if vid not in existing:
                     study_variables[study_id].append({
