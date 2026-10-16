@@ -26,7 +26,6 @@ import uvicorn
 
 NAME_RESOLUTION_URL = "https://name-resolution-sri.renci.org/lookup"
 SAP_QDRANT_URL = "https://sap-qdrant.apps.renci.org/annotate/"
-PICSURE_SEARCH_URL = "https://picsure.biodatacatalyst.nhlbi.nih.gov/picsure/search/ac004461-1b47-4832-80e2-22a4aecabe39"
 
 # Load environment variables from .env file
 load_dotenv()
@@ -1304,7 +1303,7 @@ async def _handle_find_concept_paths(arguments: dict, graph) -> list[TextContent
     return [TextContent(type="text", text=out)]
 
 
-async def _handle_picsure_search(arguments: dict, graph) -> list[TextContent]:
+async def _handle_find_variables(arguments: dict, graph) -> list[TextContent]:
     phv_ids  = arguments.get("phv_ids", [])
     keyword  = arguments.get("keyword", "")
     semantic = arguments.get("semantic", True)
@@ -1313,101 +1312,95 @@ async def _handle_picsure_search(arguments: dict, graph) -> list[TextContent]:
     if not phv_ids and not keyword:
         return [TextContent(type="text", text=to_json({"error": "Provide phv_ids or keyword"}))]
 
-    enrichment_info  = None
-    warnings         = []
-    original_keyword = keyword
-    phv_to_concepts: dict = {}
+    enrichment_info = None
+    warnings: list  = []
+    vars_dict: dict = {}
 
-    # Semantic mode: enrich keyword → KG → phv IDs, then PIC-SURE path lookup
-    if keyword and semantic:
-        synonyms = await fetch_synonyms(keyword)
-        curies   = synonyms["curies"]
-        labels   = synonyms["labels"]
-        warnings.extend(synonyms.get("warnings", []))
-        enrichment_info = {"curies": curies, "labels": labels}
-
-        where_expr = _build_synonym_where(curies, labels, keyword)
+    if keyword:
+        if semantic:
+            synonyms = await fetch_synonyms(keyword)
+            curies   = synonyms["curies"]
+            labels   = synonyms["labels"]
+            warnings.extend(synonyms.get("warnings", []))
+            enrichment_info = {"curies": curies, "labels": labels}
+            where_expr = _build_synonym_where(curies, labels, keyword)
+        else:
+            safe = keyword.replace('"', '')
+            where_expr = f'concept.name =~ "(?i).*{safe}.*"'
 
         kg_query = f"""
         MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
         WHERE ({where_expr})
           AND NOT labels(concept)[0] = 'biolink.StudyVariable'
-        RETURN DISTINCT v.id AS variable_id, concept.id AS concept_id, concept.name AS concept_name
+        OPTIONAL MATCH (v)-[]-(s:`biolink.Study`)
+        RETURN DISTINCT v.id AS variable_id, v.name AS variable_name,
+               s.id AS study_id, s.name AS study_name,
+               concept.id AS concept_id, concept.name AS concept_name
         LIMIT {limit * 5}
         """
-        kg_result = graph.query(kg_query)
-        kg_rows   = results_to_list(kg_result.result_set, kg_result.header) if kg_result.result_set else []
-
-        kg_phv_ids = []
-        for row in kg_rows:
-            vid = row.get("variable_id") or ""
-            phv = vid.split(".")[0] if "." in vid else vid
-            if not phv.startswith("phv"):
-                continue
-            if phv not in phv_to_concepts:
-                phv_to_concepts[phv] = []
-                kg_phv_ids.append(phv)
-            concept_entry = {"concept_id": row.get("concept_id"), "concept_name": row.get("concept_name")}
-            if concept_entry not in phv_to_concepts[phv]:
-                phv_to_concepts[phv].append(concept_entry)
-
-        phv_ids = list(dict.fromkeys(list(phv_ids) + kg_phv_ids))
-        keyword = ""  # phv IDs now drive the PIC-SURE lookup
-
-    # Strip version suffixes: "phv00425822.v1.p1" → "phv00425822"
-    search_terms = [pid.split(".")[0] if "." in pid else pid for pid in phv_ids]
-    if keyword:
-        search_terms.append(keyword)
-    search_terms = list(dict.fromkeys(search_terms))  # deduplicate
-
-    results: list = []
-    seen_paths: set = set()
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        responses = await asyncio.gather(*[
-            client.post(PICSURE_SEARCH_URL, json={"query": term})
-            for term in search_terms
-        ], return_exceptions=True)
-
-    for term, resp in zip(search_terms, responses):
-        if len(results) >= limit:
-            break
-        if isinstance(resp, Exception):
-            warnings.append(f"PIC-SURE search failed for '{term}': {resp}")
-            continue
-        if resp.status_code != 200:
-            warnings.append(f"PIC-SURE returned HTTP {resp.status_code} for '{term}'")
-            continue
         try:
-            phenotypes = resp.json().get("results", {}).get("phenotypes", {})
-            for path, meta in phenotypes.items():
-                if len(results) >= limit:
-                    break
-                if path in seen_paths:
+            kg_result = graph.query(kg_query)
+            kg_rows   = results_to_list(kg_result.result_set, kg_result.header) if kg_result.result_set else []
+            for row in kg_rows:
+                vid = row.get("variable_id") or ""
+                if not vid:
                     continue
-                seen_paths.add(path)
-                parts      = [p for p in path.strip("\\").split("\\") if p]
-                study      = parts[0] if parts else None
-                phv        = next((p for p in parts if p.startswith("phv")), None)
-                vname      = parts[-1] if len(parts) > 1 else None
-                cat_values = meta.get("categoryValues", [])
-                entry = {
-                    "picsure_path": path,
-                    "study": study,
-                    "phv_id": phv,
-                    "variable_name": vname,
-                    "categorical": meta.get("categorical"),
-                    "category_values": cat_values[:20],
-                    "total_category_values": len(cat_values),
-                }
-                if phv and phv in phv_to_concepts:
-                    entry["matched_concepts"] = phv_to_concepts[phv]
-                results.append(entry)
+                if vid not in vars_dict:
+                    vars_dict[vid] = {
+                        "variable_id":     vid,
+                        "variable_name":   row.get("variable_name"),
+                        "study_id":        row.get("study_id"),
+                        "study_name":      row.get("study_name"),
+                        "matched_concepts": [],
+                    }
+                if row.get("concept_id"):
+                    entry = {"concept_id": row["concept_id"], "concept_name": row.get("concept_name")}
+                    if entry not in vars_dict[vid]["matched_concepts"]:
+                        vars_dict[vid]["matched_concepts"].append(entry)
         except Exception as e:
-            warnings.append(f"Failed to parse PIC-SURE response for '{term}': {e}")
+            warnings.append(f"KG query failed: {e}")
 
+    if phv_ids:
+        # Look up phv IDs directly in KG (STARTS WITH to match version-suffixed IDs)
+        where_clauses = " OR ".join(
+            f'v.id STARTS WITH "{pid.split(".")[0]}"' for pid in phv_ids
+        )
+        kg_query = f"""
+        MATCH (v:`biolink.StudyVariable`)
+        WHERE {where_clauses}
+        OPTIONAL MATCH (concept)-[]-(v)
+        WHERE NOT labels(concept)[0] = 'biolink.StudyVariable'
+        OPTIONAL MATCH (v)-[]-(s:`biolink.Study`)
+        RETURN DISTINCT v.id AS variable_id, v.name AS variable_name,
+               s.id AS study_id, s.name AS study_name,
+               concept.id AS concept_id, concept.name AS concept_name
+        LIMIT {limit * 5}
+        """
+        try:
+            kg_result = graph.query(kg_query)
+            kg_rows   = results_to_list(kg_result.result_set, kg_result.header) if kg_result.result_set else []
+            for row in kg_rows:
+                vid = row.get("variable_id") or ""
+                if not vid:
+                    continue
+                if vid not in vars_dict:
+                    vars_dict[vid] = {
+                        "variable_id":     vid,
+                        "variable_name":   row.get("variable_name"),
+                        "study_id":        row.get("study_id"),
+                        "study_name":      row.get("study_name"),
+                        "matched_concepts": [],
+                    }
+                if row.get("concept_id"):
+                    entry = {"concept_id": row["concept_id"], "concept_name": row.get("concept_name")}
+                    if entry not in vars_dict[vid]["matched_concepts"]:
+                        vars_dict[vid]["matched_concepts"].append(entry)
+        except Exception as e:
+            warnings.append(f"KG phv lookup failed: {e}")
+
+    results = list(vars_dict.values())[:limit]
     out = _truncate(to_json({
-        "keyword": original_keyword if original_keyword else None,
-        "mode": "semantic" if (original_keyword and semantic) else "direct",
+        **({"keyword": keyword} if keyword else {}),
         **({"enrichment": enrichment_info} if enrichment_info else {}),
         "total_variables_found": len(results),
         "variables": results,
@@ -1576,7 +1569,7 @@ _TOOL_HANDLERS = {
     "search_variables_by_name":        _handle_search_variables_by_name,
     "expand_concept":                  _handle_expand_concept,
     "find_concept_paths":              _handle_find_concept_paths,
-    "find_variables":                  _handle_picsure_search,
+    "find_variables":                  _handle_find_variables,
     "find_cohort_variables":           _handle_find_cohort_variables,
 }
 
